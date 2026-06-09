@@ -65,6 +65,12 @@ static NSPanel      *g_floatingPanel = nil;
 
 static bool sPanelVisible = false;
 static bool sTemplateLoaded = false;
+// True only after the WKWebView finishes loading the HTML template (so the
+// renderMarkdown() JS + marked.js/highlight.js are available). Renders are
+// gated on this and flushed from -didFinishNavigation: — a fixed dispatch_after
+// delay raced the (slower) cold WebKit start on Tahoe, dropping the first render
+// and leaving the placeholder until the panel was closed/reopened.
+static bool sWebViewReady = false;
 static std::string sLastRenderedText;
 static std::string sCurrentFilePath;
 static std::string sCurrentTempHtmlPath; // Track temp file for cleanup
@@ -1019,6 +1025,24 @@ static void printMarkdownPreview() {
     }
     handler(WKNavigationActionPolicyCancel);
 }
+
+// The template HTML (with renderMarkdown() + marked.js/highlight.js) has
+// finished loading — now it's safe to inject markdown. Flush the current
+// document instead of relying on a fixed timer that can fire too early on a
+// cold WebKit start (the Tahoe first-open race).
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    sWebViewReady = true;
+    renderMarkdownDirect();
+}
+
+// Never leave the view permanently "not ready" if a load fails — allow later
+// loads/renders to proceed rather than getting stuck on the placeholder.
+- (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    sWebViewReady = true;
+}
+- (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    sWebViewReady = true;
+}
 @end
 
 static MarkdownNavigationDelegate *sNavDelegate = nil;
@@ -1211,6 +1235,7 @@ static void loadTemplateIntoWebView() {
         [htmlStr writeToFile:tmpPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
         NSURL *fileURL = [NSURL fileURLWithPath:tmpPath];
+        sWebViewReady = false;   // navigation starts now; -didFinishNavigation: flips it true
         [sWebView loadFileURL:fileURL allowingReadAccessToURL:accessURL];
 
         sTemplateLoaded = true;
@@ -1237,6 +1262,10 @@ static std::string getEditorText() {
 
 static void renderMarkdownDirect() {
     if (!sPanelVisible || !sWebView) return;
+    // Page not finished loading yet — injecting now would be lost (the
+    // renderMarkdown() JS doesn't exist). -didFinishNavigation: will call us
+    // again once the template is ready.
+    if (!sWebViewReady) return;
     if (!isSupportedExtension()) {
         // Show "not a markdown file" message
         [sWebView evaluateJavaScript:
