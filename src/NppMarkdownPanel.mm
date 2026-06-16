@@ -690,7 +690,11 @@ static std::string getConfigPath() {
     if (buf[0] != '\0') {
         dir = [NSString stringWithUTF8String:buf];
     } else {
-        dir = [NSHomeDirectory() stringByAppendingPathComponent:@".nextpad++"];
+        // Fallback only if the host returns empty (it does not on shipped
+        // versions): the app-support base, NOT a legacy ~/.nextpad++ dot-folder.
+        dir = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
+                   NSUserDomainMask, YES).firstObject
+                   stringByAppendingPathComponent:@"Nextpad++/plugins/Config"];
     }
     return std::string([dir UTF8String]) + "/NppMarkdownPanel.json";
 }

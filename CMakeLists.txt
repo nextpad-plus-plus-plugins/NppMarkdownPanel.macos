@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(NppMarkdownPanel LANGUAGES CXX OBJCXX)
+project(NppMarkdownPanel VERSION 1.0.5 LANGUAGES CXX OBJCXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_OBJCXX_STANDARD 17)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
@@ -20,7 +20,9 @@ target_link_libraries(NppMarkdownPanel PRIVATE
     "-framework WebKit"
     "-framework UniformTypeIdentifiers")
 set_target_properties(NppMarkdownPanel PROPERTIES PREFIX "" SUFFIX ".dylib")
-set(PLUGIN_INSTALL_DIR "$ENV{HOME}/.nextpad++/plugins/NppMarkdownPanel")
+# Stamp version into the dylib Mach-O current_version (Plugins Admin reads it).
+target_link_options(NppMarkdownPanel PRIVATE "-Wl,-current_version,${PROJECT_VERSION}")
+set(PLUGIN_INSTALL_DIR "$ENV{HOME}/Library/Application Support/Nextpad++/plugins/NppMarkdownPanel")
 install(TARGETS NppMarkdownPanel DESTINATION "${PLUGIN_INSTALL_DIR}")
 # Vendor JS/CSS/icons + help.md the runtime reads from <dylib_dir>/resources/.
 # Without this `make install` only deploys the dylib and the plugin fails
