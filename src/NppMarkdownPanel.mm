@@ -1231,11 +1231,11 @@ static void ensureContentView() {
         [sContentView addSubview:sRefreshButton];
 
         sPdfButton = [[_NMPPanelButton alloc] init];
-        sPdfButton.symbolName = @"square.and.arrow.down";
-        sPdfButton.accentBlue = YES;
-        sPdfButton.toolTip    = @"Save as PDF";
-        sPdfButton.target     = [_NMPSearchFieldDelegate class];
-        sPdfButton.action     = @selector(_doSavePDF);
+        sPdfButton.lightIconName = @"save_light";  // save/floppy icon (light + dark variants)
+        sPdfButton.darkIconName  = @"save_dark";
+        sPdfButton.toolTip       = @"Save as PDF";
+        sPdfButton.target        = [_NMPSearchFieldDelegate class];
+        sPdfButton.action        = @selector(_doSavePDF);
         [sPdfButton reloadIcon];
         [sContentView addSubview:sPdfButton];
 
