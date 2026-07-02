@@ -42,6 +42,8 @@ struct MarkdownSettings {
     bool allowAllExtensions = false;
     std::string supportedExtensions = "md,mkd,mdwn,mdown,mdtxt,markdown,mmd";
     bool enableMermaid = false;
+    bool enableSquared = false;              // render mermaid flowcharts in the "squared" style
+    std::string squaredTheme = "boardroom";  // boardroom | linen | blueprint
 };
 
 static MarkdownSettings sSettings;
@@ -263,6 +265,20 @@ mark.npp-find.current { background: #ff9800; box-shadow: 0 0 0 2px rgba(255,152,
 }
 )CSS";
 
+// Longest common ancestor directory of two absolute paths — used to scope the
+// WKWebView's file read-access so a file:// preview page (written next to the
+// user's markdown) can also reach the plugin's resources/squared engine dir.
+static NSString *commonAncestorDir(NSString *a, NSString *b) {
+    NSArray<NSString *> *pa = [a pathComponents], *pb = [b pathComponents];
+    NSMutableArray<NSString *> *common = [NSMutableArray array];
+    NSUInteger n = MIN(pa.count, pb.count);
+    for (NSUInteger i = 0; i < n; i++) {
+        if ([pa[i] isEqualToString:pb[i]]) [common addObject:pa[i]]; else break;
+    }
+    NSString *p = common.count ? [NSString pathWithComponents:common] : @"/";
+    return p.length ? p : @"/";
+}
+
 static void buildTemplate() {
     @autoreleasepool {
         std::string markedJS = readFileToString(sResourcesDir + "/marked.min.js");
@@ -294,6 +310,10 @@ static void buildTemplate() {
 
         // Zoom
         html += "<style>body { zoom: " + std::to_string(sSettings.zoomLevel) + "%; }</style>\n";
+        html += "<style>.squared-diagram{margin:16px 0;} .squared-diagram svg{max-width:100%;height:auto;}"
+                " pre.squared-pending{background:transparent;border:none;padding:6px 0;}"
+                " pre.squared-pending code{display:none;}"
+                " pre.squared-pending::after{content:\"Rendering diagram\\2026\";color:#888;font-style:italic;}</style>\n";
 
         // JS libraries
         html += "<script>\n" + markedJS + "\n</script>\n";
@@ -304,9 +324,71 @@ static void buildTemplate() {
             html += "<script>\n" + mermaidJS + "\n</script>\n";
         }
 
+        // The "squared" diagram engine, loaded as a file:// ES module from the plugin
+        // resources (no network). The classic flag script runs synchronously; the
+        // module script defers until after the app JS defines window.renderDiagrams(),
+        // then renders any current diagram blocks.
+        if (sSettings.enableSquared) {
+            // Load the engine as a file:// module from the plugin resources (no network).
+            // NSURL handles percent-encoding of the path (e.g. the space in "Application
+            // Support"). squared.js's own imports + its Web Worker resolve relative to
+            // this file:// URL, so they stay same-origin with the file:// preview page.
+            NSString *jsPath = [NSString stringWithUTF8String:(sResourcesDir + "/squared/squared.js").c_str()];
+            NSString *jsURL  = [[NSURL fileURLWithPath:jsPath] absoluteString];
+            html += "<script>window.__squaredIntended=true;window.__squaredTheme='"
+                  + sSettings.squaredTheme + "';</script>\n";
+            html += "<script type=\"module\">\n";
+            html += "try{\n";
+            html += "  const m = await import('" + std::string([jsURL UTF8String]) + "');\n";
+            html += "  window.renderSquared = m.renderSquared;\n";
+            html += "  if (m.initSquared) m.initSquared();\n";
+            html += "  if (window.renderDiagrams) window.renderDiagrams();\n";
+            html += "}catch(e){ console.error('[squared] engine load failed', e); }\n";
+            html += "</script>\n";
+        }
+
         // Application JS
         html += R"HTML(
 <script>
+// Diagram rendering. Targets inline ```mermaid code blocks
+// (pre code.language-mermaid) — the same blocks mermaid uses — so it works for
+// diagrams inlined in .md files AND standalone .mmd files (wrapped natively).
+// When "squared" is enabled it renders flowcharts in the squared style (async, via a
+// Web Worker; non-flowcharts fall back to mermaid inside the engine). Otherwise
+// it uses the classic mermaid path. Re-invoked when the squared engine loads.
+window.renderDiagrams = function() {
+  var blocks = document.querySelectorAll('pre code.language-mermaid');
+  if (!blocks.length) return;
+  if (window.__squaredIntended) {
+    var ready = (typeof window.renderSquared === 'function');
+    blocks.forEach(function(el) {
+      if (el.getAttribute('data-sq')) return;              // process each block once
+      var pre = el.parentNode, src = el.textContent;
+      pre.classList.add('squared-pending');                // hide raw source immediately (no flash)
+      if (!ready) return;                                  // engine still loading; stays hidden, re-runs on load
+      el.setAttribute('data-sq', '1');
+      window.renderSquared(src, { theme: window.__squaredTheme || 'boardroom' }).then(function(res) {
+        if (res && res.ok && res.svg && pre.parentNode) {
+          var wrap = document.createElement('div');
+          wrap.className = 'squared-diagram';
+          if (pre.id) wrap.id = pre.id;                    // keep block id for scroll sync
+          wrap.innerHTML = res.svg;
+          pre.parentNode.replaceChild(wrap, pre);
+        } else {
+          pre.classList.remove('squared-pending');         // render failed → reveal the source
+        }
+      }).catch(function(e) { console.error('[squared] render', e); pre.classList.remove('squared-pending'); });
+    });
+  } else if (typeof mermaid !== 'undefined') {
+    blocks.forEach(function(el) {
+      var pre = el.parentNode;
+      pre.classList.add('mermaid');
+      pre.innerHTML = el.textContent;
+    });
+    try { mermaid.run({ querySelector: '.mermaid' }); } catch (e) {}
+  }
+};
+
 // Render function called from native code.
 // Uses marked.js defaults for ALL rendering (no custom renderer overrides
 // that might break across marked.js versions), then post-processes the HTML
@@ -372,15 +454,8 @@ function renderMarkdown(md) {
     });
   }
 
-  // Re-run mermaid for ```mermaid code blocks if available
-  if (typeof mermaid !== 'undefined') {
-    document.querySelectorAll('pre code.language-mermaid').forEach(function(el) {
-      var pre = el.parentNode;
-      pre.classList.add('mermaid');
-      pre.innerHTML = el.textContent;
-    });
-    try { mermaid.run({querySelector: '.mermaid'}); } catch(e) {}
-  }
+  // Diagrams: "squared" style when enabled, else mermaid (see window.renderDiagrams).
+  if (window.renderDiagrams) window.renderDiagrams();
 
   window._totalLines = md.split('\n').length;
 
@@ -716,6 +791,8 @@ static void loadSettings() {
         if ((v = dict[@"allowAllExtensions"])) sSettings.allowAllExtensions = [v boolValue];
         if ((s = dict[@"supportedExtensions"])) sSettings.supportedExtensions = [s UTF8String];
         if ((v = dict[@"enableMermaid"])) sSettings.enableMermaid = [v boolValue];
+        if ((v = dict[@"enableSquared"])) sSettings.enableSquared = [v boolValue];
+        if ((s = dict[@"squaredTheme"])) sSettings.squaredTheme = [s UTF8String];
 
         // Migration: ensure .mmd is in the supported extensions list
         {
@@ -754,6 +831,8 @@ static void saveSettings() {
             @"allowAllExtensions": @(sSettings.allowAllExtensions),
             @"supportedExtensions": @(sSettings.supportedExtensions.c_str()),
             @"enableMermaid": @(sSettings.enableMermaid),
+            @"enableSquared": @(sSettings.enableSquared),
+            @"squaredTheme": @(sSettings.squaredTheme.c_str()),
         };
         NSData *data = [NSJSONSerialization dataWithJSONObject:dict
                                                       options:NSJSONWritingPrettyPrinted error:nil];
@@ -778,8 +857,10 @@ static void saveSettings() {
 @interface _NMPPanelButton : NSButton {
     BOOL _hovering;
 }
-@property (nonatomic, copy) NSString *lightIconName;  // basename w/o .png
+@property (nonatomic, copy) NSString *lightIconName;  // basename w/o .png (PNG icons)
 @property (nonatomic, copy) NSString *darkIconName;
+@property (nonatomic, copy) NSString *symbolName;     // SF Symbol name (overrides PNG when set)
+@property (nonatomic, assign) BOOL     accentBlue;    // render the symbol with a blue (system) accent
 - (void)reloadIcon;
 @end
 
@@ -818,17 +899,44 @@ static void saveSettings() {
 }
 
 - (void)reloadIcon {
-    NSString *name = [self _isDark] ? _darkIconName : _lightIconName;
-    if (!name.length) return;
-    NSString *path = [NSString stringWithFormat:@"%s/%@.png",
-                      sResourcesDir.c_str(), name];
-    NSImage *img = [[NSImage alloc] initWithContentsOfFile:path];
-    if (img) {
-        // 11pt rendered size matches FolderTreePanel's kFTToolbarIconSize
-        // — the image's own PNG is high-res; we down-render at 11pt.
-        img.size = NSMakeSize(11, 11);
-        self.image = img;
+    NSImage *img = nil;
+    if (_symbolName.length) {
+        // SF Symbol rendered into a fixed 12×12 image — uniform with the other icon
+        // buttons so the hover highlight is a matching square. accentBlue → the
+        // two-tone square.and.arrow.down look (dark glyph + blue enclosure).
+        if (@available(macOS 11.0, *)) {
+            NSImage *sym = [NSImage imageWithSystemSymbolName:_symbolName accessibilityDescription:nil];
+            NSImageSymbolConfiguration *sizeCfg =
+                [NSImageSymbolConfiguration configurationWithPointSize:12 weight:NSFontWeightRegular];
+            BOOL twoTone = NO;
+            if (_accentBlue) {
+                if (@available(macOS 12.0, *)) {
+                    NSImageSymbolConfiguration *pal = [NSImageSymbolConfiguration
+                        configurationWithPaletteColors:@[[NSColor labelColor], [NSColor systemBlueColor]]];
+                    NSImage *c = [sym imageWithSymbolConfiguration:[sizeCfg configurationByApplyingConfiguration:pal]];
+                    if (c) { sym = c; twoTone = YES; }   // two colors — draw as-is
+                }
+            }
+            if (!twoTone) { NSImage *c = [sym imageWithSymbolConfiguration:sizeCfg]; if (c) sym = c; }
+            NSColor *flat = _accentBlue ? [NSColor systemBlueColor] : [NSColor labelColor];
+            img = [NSImage imageWithSize:NSMakeSize(12, 12) flipped:NO drawingHandler:^BOOL(NSRect r) {
+                [sym drawInRect:r fromRect:NSZeroRect operation:NSCompositingOperationSourceOver
+                       fraction:1.0 respectFlipped:YES hints:nil];
+                if (!twoTone) { [flat set]; NSRectFillUsingOperation(r, NSCompositingOperationSourceAtop); }
+                return YES;
+            }];
+        }
+    } else {
+        NSString *name = [self _isDark] ? _darkIconName : _lightIconName;
+        if (name.length) {
+            // 11pt rendered size matches FolderTreePanel's kFTToolbarIconSize
+            // — the image's own PNG is high-res; we down-render at 11pt.
+            NSString *path = [NSString stringWithFormat:@"%s/%@.png", sResourcesDir.c_str(), name];
+            img = [[NSImage alloc] initWithContentsOfFile:path];
+            if (img) img.size = NSMakeSize(11, 11);
+        }
     }
+    if (img) self.image = img;
     [self setNeedsDisplay:YES];
 }
 
@@ -881,6 +989,9 @@ static void saveSettings() {
 // Static forward declarations for the two C functions the delegate calls.
 static void markdownApplySearchQuery(NSString *query);
 static void printMarkdownPreview();
+static void refreshMarkdownPreview();
+static void saveMarkdownAsPDF();
+static void adjustPreviewZoom(int delta);
 
 @implementation _NMPSearchFieldDelegate
 
@@ -906,7 +1017,10 @@ static void printMarkdownPreview();
 // Print button forwards here — keeps the action receiver in ObjC while the
 // actual work happens in a C function that has access to the static state
 // (sWebView, etc.) without bridging.
-+ (void)_doPrint { printMarkdownPreview(); }
++ (void)_doPrint    { printMarkdownPreview(); }
++ (void)_doSettings { showSettingsCmd(); }
++ (void)_doRefresh  { refreshMarkdownPreview(); }
++ (void)_doSavePDF  { saveMarkdownAsPDF(); }
 
 @end
 
@@ -916,6 +1030,10 @@ static void printMarkdownPreview();
 static _NMPSearchFieldDelegate *sSearchDelegate = nil;
 static NSTextField             *sSearchField    = nil;
 static _NMPPanelButton         *sPrintButton    = nil;
+static _NMPPanelButton         *sSettingsButton = nil;
+static _NMPPanelButton         *sRefreshButton  = nil;
+static _NMPPanelButton         *sPdfButton      = nil;
+static id                       sZoomKeyMonitor = nil;
 
 // Latest search query, kept so we can reapply after every re-render. Non-
 // empty only while the user has typed into the search field.
@@ -1095,13 +1213,49 @@ static void ensureContentView() {
         [sPrintButton reloadIcon];
         [sContentView addSubview:sPrintButton];
 
+        // ── Settings / Refresh / Save-PDF buttons (SF Symbols, print-icon size) ──
+        sSettingsButton = [[_NMPPanelButton alloc] init];
+        sSettingsButton.symbolName = @"gearshape";
+        sSettingsButton.toolTip    = @"Settings";
+        sSettingsButton.target     = [_NMPSearchFieldDelegate class];
+        sSettingsButton.action     = @selector(_doSettings);
+        [sSettingsButton reloadIcon];
+        [sContentView addSubview:sSettingsButton];
+
+        sRefreshButton = [[_NMPPanelButton alloc] init];
+        sRefreshButton.symbolName = @"arrow.clockwise";
+        sRefreshButton.toolTip    = @"Refresh preview";
+        sRefreshButton.target     = [_NMPSearchFieldDelegate class];
+        sRefreshButton.action     = @selector(_doRefresh);
+        [sRefreshButton reloadIcon];
+        [sContentView addSubview:sRefreshButton];
+
+        sPdfButton = [[_NMPPanelButton alloc] init];
+        sPdfButton.symbolName = @"square.and.arrow.down";
+        sPdfButton.accentBlue = YES;
+        sPdfButton.toolTip    = @"Save as PDF";
+        sPdfButton.target     = [_NMPSearchFieldDelegate class];
+        sPdfButton.action     = @selector(_doSavePDF);
+        [sPdfButton reloadIcon];
+        [sContentView addSubview:sPdfButton];
+
         // ── WKWebView ──────────────────────────────────────────────────
         WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
         config.defaultWebpagePreferences.allowsContentJavaScript = YES;
+        // The "squared" engine loads as file:// ES modules + a file:// module Web Worker.
+        // A Worker must be same-origin as the page (which is file://), so relax file-URL
+        // access (KVC — the standard WKWebView keys for local preview content). This lets
+        // the file:// preview import the engine from the plugin resources dir and lets the
+        // engine spawn its file:// worker.
+        @try { [config.preferences setValue:@YES forKey:@"allowFileAccessFromFileURLs"]; } @catch (id e) {}
+        @try { [config setValue:@YES forKey:@"allowUniversalAccessFromFileURLs"]; } @catch (id e) {}
 
         sWebView = [[WKWebView alloc] initWithFrame:NSZeroRect
                                        configuration:config];
         sWebView.translatesAutoresizingMaskIntoConstraints = NO;
+        // Allow Web Inspector (right-click → Inspect Element) to debug the
+        // squared/mermaid render path. macOS 13.3+.
+        if (@available(macOS 13.3, *)) { sWebView.inspectable = YES; }
 
         sNavDelegate = [[MarkdownNavigationDelegate alloc] init];
         sWebView.navigationDelegate = sNavDelegate;
@@ -1114,12 +1268,18 @@ static void ensureContentView() {
             // print button; 22pt tall (matches FunctionList row height).
             [sSearchField.topAnchor      constraintEqualToAnchor:sContentView.topAnchor constant:4],
             [sSearchField.leadingAnchor  constraintEqualToAnchor:sContentView.leadingAnchor constant:6],
-            [sSearchField.trailingAnchor constraintEqualToAnchor:sPrintButton.leadingAnchor constant:-6],
+            [sSearchField.trailingAnchor constraintEqualToAnchor:sSettingsButton.leadingAnchor constant:-8],
             [sSearchField.heightAnchor   constraintEqualToConstant:22],
 
-            // Print button — 16×16 (width/height constraints added in init)
-            [sPrintButton.trailingAnchor constraintEqualToAnchor:sContentView.trailingAnchor constant:-6],
-            [sPrintButton.centerYAnchor  constraintEqualToAnchor:sSearchField.centerYAnchor],
+            // Toolbar buttons (16×16 each), left→right: settings, refresh, save-PDF, print.
+            [sSettingsButton.trailingAnchor constraintEqualToAnchor:sRefreshButton.leadingAnchor constant:-8],
+            [sSettingsButton.centerYAnchor  constraintEqualToAnchor:sSearchField.centerYAnchor],
+            [sRefreshButton.trailingAnchor  constraintEqualToAnchor:sPdfButton.leadingAnchor constant:-8],
+            [sRefreshButton.centerYAnchor   constraintEqualToAnchor:sSearchField.centerYAnchor],
+            [sPdfButton.trailingAnchor      constraintEqualToAnchor:sPrintButton.leadingAnchor constant:-8],
+            [sPdfButton.centerYAnchor       constraintEqualToAnchor:sSearchField.centerYAnchor],
+            [sPrintButton.trailingAnchor    constraintEqualToAnchor:sContentView.trailingAnchor constant:-6],
+            [sPrintButton.centerYAnchor     constraintEqualToAnchor:sSearchField.centerYAnchor],
 
             // WebView fills below the toolbar row, flush to edges.
             [sWebView.topAnchor      constraintEqualToAnchor:sSearchField.bottomAnchor constant:4],
@@ -1127,6 +1287,29 @@ static void ensureContentView() {
             [sWebView.trailingAnchor constraintEqualToAnchor:sContentView.trailingAnchor],
             [sWebView.bottomAnchor   constraintEqualToAnchor:sContentView.bottomAnchor],
         ]];
+
+        // Cmd +/- (and Cmd 0 to reset) zoom the preview live — only while the preview
+        // WebView is focused, so the editor's own Cmd +/- zoom is never hijacked.
+        if (!sZoomKeyMonitor) {
+            sZoomKeyMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                handler:^NSEvent *(NSEvent *e) {
+                if (!(e.modifierFlags & NSEventModifierFlagCommand)) return e;
+                if (!sWebView || !sPanelVisible) return e;
+                NSWindow *w = sWebView.window;
+                if (!w || w != [NSApp keyWindow]) return e;
+                BOOL inPreview = NO;
+                NSResponder *fr = w.firstResponder;
+                if ([fr isKindOfClass:[NSView class]]) {
+                    for (NSView *v = (NSView *)fr; v; v = v.superview) { if (v == sWebView) { inPreview = YES; break; } }
+                }
+                if (!inPreview) return e;
+                NSString *ch = e.charactersIgnoringModifiers;
+                if ([ch isEqualToString:@"="] || [ch isEqualToString:@"+"]) { adjustPreviewZoom(+10); return nil; }
+                if ([ch isEqualToString:@"-"] || [ch isEqualToString:@"_"]) { adjustPreviewZoom(-10); return nil; }
+                if ([ch isEqualToString:@"0"])                              { adjustPreviewZoom(100 - sSettings.zoomLevel); return nil; }
+                return e;
+            }];
+        }
     }
 }
 
@@ -1226,6 +1409,16 @@ static void loadTemplateIntoWebView() {
             tmpPath = [NSTemporaryDirectory()
                 stringByAppendingPathComponent:@"npp-md-preview.html"];
             accessURL = [NSURL fileURLWithPath:NSTemporaryDirectory()];
+        }
+
+        // When squared is enabled, the preview imports the engine from the plugin
+        // resources dir (a different tree). Widen the read-access scope to the common
+        // ancestor of the preview file and the resources dir so the file:// import +
+        // worker resolve. (Only when the feature is on.)
+        if (sSettings.enableSquared) {
+            NSString *htmlDir = [tmpPath stringByDeletingLastPathComponent];
+            NSString *resDir  = [NSString stringWithUTF8String:sResourcesDir.c_str()];
+            accessURL = [NSURL fileURLWithPath:commonAncestorDir(htmlDir, resDir)];
         }
 
         // Clean up previous temp file if it was in a different directory
@@ -1497,6 +1690,60 @@ static void syncWithFirstVisibleLineCmd() {
     if (sSettings.syncWithCaret || sSettings.syncWithFirstVisibleLine) syncScroll();
 }
 
+// Toolbar "refresh": force a full re-render — rebuild the HTML template and
+// reload the WebView from scratch (clears the render/baseURL caches first).
+static void refreshMarkdownPreview() {
+    if (!sPanelVisible) return;
+    sLastRenderedText.clear();
+    sCurrentFilePath.clear();          // forces loadTemplateIntoWebView to rebuild
+    buildTemplate();
+    loadTemplateIntoWebView();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{ renderMarkdownDirect(); });
+}
+
+// Toolbar "save as PDF": render the current preview to a PDF file via WKWebView.
+static void saveMarkdownAsPDF() {
+    if (!sPanelVisible || !sWebView) return;
+    @autoreleasepool {
+        NSSavePanel *panel = [NSSavePanel savePanel];
+        panel.allowedContentTypes = @[[UTType typeWithFilenameExtension:@"pdf"]];
+        NSString *base = @"preview";
+        std::string fp = getCurrentFilePath();
+        if (!fp.empty()) {
+            NSString *p = [[NSString stringWithUTF8String:fp.c_str()] lastPathComponent];
+            NSString *stem = [p stringByDeletingPathExtension];
+            if (stem.length) base = stem;
+        }
+        panel.nameFieldStringValue = [base stringByAppendingPathExtension:@"pdf"];
+        if ([panel runModal] == NSModalResponseOK && panel.URL) {
+            NSURL *dest = panel.URL;
+            if (@available(macOS 11.0, *)) {
+                WKPDFConfiguration *cfg = [[WKPDFConfiguration alloc] init];
+                [sWebView createPDFWithConfiguration:cfg completionHandler:^(NSData *data, NSError *error) {
+                    if (data) [data writeToURL:dest atomically:YES];
+                    else NSLog(@"[MarkdownPanel] PDF export failed: %@", error);
+                }];
+            }
+        }
+    }
+}
+
+// Cmd +/- (and Cmd 0): adjust the preview zoom live via JS (no re-render) and
+// persist. Reset is expressed as delta = 100 - current.
+static void adjustPreviewZoom(int delta) {
+    int z = sSettings.zoomLevel + delta;
+    if (z < 50)  z = 50;
+    if (z > 300) z = 300;
+    if (z == sSettings.zoomLevel) return;
+    sSettings.zoomLevel = z;
+    if (sWebView && sWebViewReady) {
+        NSString *js = [NSString stringWithFormat:@"document.body.style.zoom='%d%%';", z];
+        [sWebView evaluateJavaScript:js completionHandler:nil];
+    }
+    saveSettings();
+}
+
 static void exportToHtmlCmd() {
     if (!sPanelVisible || !sWebView) return;
     @autoreleasepool {
@@ -1516,14 +1763,33 @@ static void exportToHtmlCmd() {
     }
 }
 
+// Live controller for the Settings dialog: gates the theme radios on the
+// "Enable Squared flow diagrams" checkbox. Radio-group exclusivity is handled
+// by AppKit (buttons sharing an action selector + superview are mutually exclusive).
+@interface _NMPSettingsCtl : NSObject
+// MRC (no ARC): the controller lives only for the synchronous modal, and the
+// buttons/array survive via the content view + the enclosing autorelease pool,
+// so plain assign is safe here.
+@property (nonatomic, assign) NSButton *squaredCheck;
+@property (nonatomic, assign) NSArray<NSButton *> *themeRadios;
+@end
+@implementation _NMPSettingsCtl
+- (void)squaredToggled:(id)sender {
+    BOOL on = self.squaredCheck.state == NSControlStateValueOn;
+    for (NSButton *r in self.themeRadios) r.enabled = on;
+}
+- (void)themePicked:(id)sender { /* AppKit enforces radio-group exclusivity */ }
+@end
+
 static void showSettingsCmd() {
     @autoreleasepool {
-        NSPanel *dlg = [[NSPanel alloc] initWithContentRect:NSMakeRect(200, 200, 420, 380)
+        NSPanel *dlg = [[NSPanel alloc] initWithContentRect:NSMakeRect(200, 200, 420, 430)
                                                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
                                                     backing:NSBackingStoreBuffered defer:NO];
         [dlg setTitle:@"Markdown Panel Settings"];
         NSView *cv = [dlg contentView];
-        CGFloat y = 340;
+        _NMPSettingsCtl *ctl = [[_NMPSettingsCtl alloc] init];
+        CGFloat y = 390;
 
         // Zoom
         NSTextField *zoomLabel = [NSTextField labelWithString:@"Zoom Level:"];
@@ -1575,7 +1841,40 @@ static void showSettingsCmd() {
         mermaidCheck.frame = NSMakeRect(20, y, 350, 20);
         mermaidCheck.state = sSettings.enableMermaid ? NSControlStateValueOn : NSControlStateValueOff;
         [cv addSubview:mermaidCheck];
-        y -= 45;
+        y -= 28;
+
+        // Squared flow diagrams + theme radios, gated on the checkbox
+        NSButton *squaredCheck = [NSButton checkboxWithTitle:@"Enable Squared flow diagrams"
+                                                      target:ctl action:@selector(squaredToggled:)];
+        squaredCheck.frame = NSMakeRect(20, y, 350, 20);
+        squaredCheck.state = sSettings.enableSquared ? NSControlStateValueOn : NSControlStateValueOff;
+        [cv addSubview:squaredCheck];
+        y -= 26;
+
+        // Display labels are Plain/Pastel/Blue; the engine's theme ids stay
+        // boardroom/linen/blueprint (see the read-back below).
+        NSButton *themeBoardroom = [NSButton radioButtonWithTitle:@"Plain" target:ctl action:@selector(themePicked:)];
+        themeBoardroom.frame = NSMakeRect(40, y, 72, 20);
+        NSButton *themeLinen = [NSButton radioButtonWithTitle:@"Pastel" target:ctl action:@selector(themePicked:)];
+        themeLinen.frame = NSMakeRect(118, y, 78, 20);
+        NSButton *themeBlueprint = [NSButton radioButtonWithTitle:@"Blue" target:ctl action:@selector(themePicked:)];
+        themeBlueprint.frame = NSMakeRect(202, y, 66, 20);
+        NSString *curTheme = @(sSettings.squaredTheme.c_str());
+        themeLinen.state     = [curTheme isEqualToString:@"linen"]     ? NSControlStateValueOn : NSControlStateValueOff;
+        themeBlueprint.state = [curTheme isEqualToString:@"blueprint"] ? NSControlStateValueOn : NSControlStateValueOff;
+        themeBoardroom.state = (themeLinen.state == NSControlStateValueOn ||
+                                themeBlueprint.state == NSControlStateValueOn)
+                                 ? NSControlStateValueOff : NSControlStateValueOn;
+        {
+            BOOL sq = sSettings.enableSquared;
+            themeBoardroom.enabled = sq; themeLinen.enabled = sq; themeBlueprint.enabled = sq;
+        }
+        [cv addSubview:themeBoardroom];
+        [cv addSubview:themeLinen];
+        [cv addSubview:themeBlueprint];
+        ctl.squaredCheck = squaredCheck;
+        ctl.themeRadios  = @[themeBoardroom, themeLinen, themeBlueprint];
+        y -= 40;
 
         // Save button
         NSButton *saveBtn = [NSButton buttonWithTitle:@"Save" target:NSApp action:@selector(stopModal)];
@@ -1604,6 +1903,11 @@ static void showSettingsCmd() {
         sSettings.syncWithFirstVisibleLine = firstLineCheck.state == NSControlStateValueOn;
         bool newMermaid = mermaidCheck.state == NSControlStateValueOn;
         if (newMermaid != sSettings.enableMermaid) { sSettings.enableMermaid = newMermaid; needsReload = true; }
+        bool newSquared = squaredCheck.state == NSControlStateValueOn;
+        if (newSquared != sSettings.enableSquared) { sSettings.enableSquared = newSquared; needsReload = true; }
+        std::string newTheme = themeLinen.state == NSControlStateValueOn ? "linen"
+                             : themeBlueprint.state == NSControlStateValueOn ? "blueprint" : "boardroom";
+        if (newTheme != sSettings.squaredTheme) { sSettings.squaredTheme = newTheme; needsReload = true; }
 
         // Update checkmarks
         npp(NPPM_SETMENUITEMCHECK, (uintptr_t)funcItem[2]._cmdID, sSettings.syncWithCaret ? 1 : 0);
@@ -1787,8 +2091,15 @@ extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
                 dispatch_block_cancel(sPendingSearch);
                 sPendingSearch = nil;
             }
+            if (sZoomKeyMonitor) {
+                [NSEvent removeMonitor:sZoomKeyMonitor];
+                sZoomKeyMonitor = nil;
+            }
             sSearchField    = nil;
             sPrintButton    = nil;
+            sSettingsButton = nil;
+            sRefreshButton  = nil;
+            sPdfButton      = nil;
             sSearchDelegate = nil;
             sContentView    = nil;
             sWebView        = nil;

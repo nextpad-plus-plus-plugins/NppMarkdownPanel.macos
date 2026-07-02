@@ -3,6 +3,8 @@
 
 # CMake build output
 build/
+docs/
+tools/
 
 # Scratch / investigation notes
 /tmp
