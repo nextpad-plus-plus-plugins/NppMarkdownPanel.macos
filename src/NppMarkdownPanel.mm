@@ -24,7 +24,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 static const char *PLUGIN_NAME = "Markdown Panel";
-static const int NB_FUNC = 8;
+static const int NB_FUNC = 11;
 static FuncItem funcItem[NB_FUNC];
 static NppData nppData;
 
@@ -73,6 +73,10 @@ static bool sTemplateLoaded = false;
 // delay raced the (slower) cold WebKit start on Tahoe, dropping the first render
 // and leaving the placeholder until the panel was closed/reopened.
 static bool sWebViewReady = false;
+// True while a silent (menu/macro) export is driving sWebView synchronously.
+// The panel's editor-triggered renders are paused during this window so they
+// can't race the export's own render (see renderMarkdownDirect/Deferred).
+static bool sExporting = false;
 static std::string sLastRenderedText;
 static std::string sCurrentFilePath;
 static std::string sCurrentTempHtmlPath; // Track temp file for cleanup
@@ -91,6 +95,7 @@ static void exportToHtmlCmd();
 static void renderMarkdownDirect();
 static void renderMarkdownDeferred();
 static void ensureContentView();
+static bool writePaginatedPdf(WKWebView *webView, NSWindow *hostWindow, NSURL *destURL);
 static NSPanel *ensureFloatingPanel();
 static BOOL markdownPanelIsShown();
 
@@ -1458,6 +1463,7 @@ static std::string getEditorText() {
 }
 
 static void renderMarkdownDirect() {
+    if (sExporting) return;   // paused during a silent export (which renders manually)
     if (!sPanelVisible || !sWebView) return;
     // Page not finished loading yet — injecting now would be lost (the
     // renderMarkdown() JS doesn't exist). -didFinishNavigation: will call us
@@ -1518,6 +1524,7 @@ static void renderMarkdownDirect() {
 }
 
 static void renderMarkdownDeferred() {
+    if (sExporting) return;   // paused during a silent export
     if (!sPanelVisible) return;
     if (sPendingRender) {
         dispatch_block_cancel(sPendingRender);
@@ -1717,14 +1724,9 @@ static void saveMarkdownAsPDF() {
         }
         panel.nameFieldStringValue = [base stringByAppendingPathExtension:@"pdf"];
         if ([panel runModal] == NSModalResponseOK && panel.URL) {
-            NSURL *dest = panel.URL;
-            if (@available(macOS 11.0, *)) {
-                WKPDFConfiguration *cfg = [[WKPDFConfiguration alloc] init];
-                [sWebView createPDFWithConfiguration:cfg completionHandler:^(NSData *data, NSError *error) {
-                    if (data) [data writeToURL:dest atomically:YES];
-                    else NSLog(@"[MarkdownPanel] PDF export failed: %@", error);
-                }];
-            }
+            // Paginated US-Letter PDF (same print path as the menu export), on the
+            // panel's own WebView + its host window.
+            writePaginatedPdf(sWebView, sWebView.window ?: g_floatingPanel, panel.URL);
         }
     }
 }
@@ -1762,6 +1764,321 @@ static void exportToHtmlCmd() {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Silent export (menu + macro/batch): render the CURRENT file and write it
+//  next to the source as <stem>.html / <stem>.pdf, with NO save dialog. Renders
+//  in a dedicated, FIXED-WIDTH, hidden WebView — so the PDF/HTML width is
+//  deterministic (≈ the panel toolbar's good width) instead of tracking the
+//  docked panel's variable width — and pumps the main run loop so the whole
+//  render→capture→write finishes before the command returns, which is what lets
+//  "Run a Macro on Folders/Files" sequence one file fully before the next. No
+//  host changes.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Layout width for the hidden export WebView. The PDF path paginates to US
+// Letter (WebKit reflows to the page, so this width doesn't drive the PDF) and
+// HTML export is fluid — this is just a sensible content width for the
+// off-screen render, independent of the docked panel's width.
+static const CGFloat kExportWidthPt = 850.0;
+static NSWindow    *sExportWindow      = nil;
+static WKWebView   *sExportWebView     = nil;
+static bool         sExportNavDone     = false;
+static std::string  sExportTempHtmlPath;
+
+@interface _NMPExportNav : NSObject <WKNavigationDelegate>
+@end
+@implementation _NMPExportNav
+- (void)webView:(WKWebView *)wv didFinishNavigation:(WKNavigation *)n { (void)wv; (void)n; sExportNavDone = true; }
+- (void)webView:(WKWebView *)wv didFailNavigation:(WKNavigation *)n withError:(NSError *)e { (void)wv; (void)n; (void)e; sExportNavDone = true; }
+- (void)webView:(WKWebView *)wv didFailProvisionalNavigation:(WKNavigation *)n withError:(NSError *)e { (void)wv; (void)n; (void)e; sExportNavDone = true; }
+@end
+static _NMPExportNav *sExportNavDelegate = nil;
+
+// Lazily build the hidden, fixed-width export WebView + its invisible host
+// window (alphaValue 0, click-through). The on-screen (but transparent) window
+// keeps WebKit compositing/laying out the content; the FIXED frame width is what
+// makes exports width-stable.
+static WKWebView *ensureExportWebView() {
+    if (sExportWebView) return sExportWebView;
+    WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
+    @try {
+        [config.preferences setValue:@YES forKey:@"allowFileAccessFromFileURLs"];
+        [config setValue:@YES forKey:@"allowUniversalAccessFromFileURLs"];
+    } @catch (__unused NSException *e) {}
+    NSRect frame = NSMakeRect(0, 0, kExportWidthPt, 700);
+    sExportWebView = [[WKWebView alloc] initWithFrame:frame configuration:config];
+    sExportNavDelegate = [[_NMPExportNav alloc] init];
+    sExportWebView.navigationDelegate = sExportNavDelegate;
+    sExportWindow = [[NSWindow alloc] initWithContentRect:frame
+                                                styleMask:NSWindowStyleMaskBorderless
+                                                  backing:NSBackingStoreBuffered defer:NO];
+    [sExportWindow setIgnoresMouseEvents:YES];
+    [sExportWindow setContentView:sExportWebView];
+    // Park it far off-screen and behind everything — a real (renderable) window
+    // the user never sees. runOperationModalForWindow (the PDF path) needs a host
+    // window; an off-screen borderless one avoids any on-screen flash.
+    [sExportWindow setFrameOrigin:NSMakePoint(-6000, -6000)];
+    [sExportWindow orderBack:nil];
+    return sExportWebView;
+}
+
+// Print-completion signal for runOperationModalForWindow (async). WKWebView
+// requires this modal-for-window variant — the plain -runOperation runs away
+// (produces a huge invalid file and never returns).
+static bool sPrintDone = false;
+static BOOL sPrintOK   = NO;
+@interface _NMPPrintDelegate : NSObject
+@end
+@implementation _NMPPrintDelegate
+- (void)printOp:(NSPrintOperation *)op success:(BOOL)success contextInfo:(void *)ctx {
+    (void)op; (void)ctx; sPrintOK = success; sPrintDone = true;
+}
+@end
+static _NMPPrintDelegate *sPrintDelegate = nil;
+
+// Load the render template into the export WebView, with its temp file next to
+// the source so relative images + the squared engine resolve. Mirrors
+// loadTemplateIntoWebView() but targets sExportWebView + its own temp file.
+static void loadTemplateIntoExportWebView() {
+    if (!sExportWebView || sFullTemplate.empty()) return;
+    @autoreleasepool {
+        std::string fp = getCurrentFilePath();
+        NSString *markdownDir = nil;
+        if (!fp.empty())
+            markdownDir = [[NSString stringWithUTF8String:fp.c_str()] stringByDeletingLastPathComponent];
+
+        NSString *tmpPath; NSURL *accessURL;
+        if (markdownDir.length > 0) {
+            tmpPath = [markdownDir stringByAppendingPathComponent:@".npp-md-export.html"];
+            accessURL = [NSURL fileURLWithPath:markdownDir];
+        } else {
+            tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"npp-md-export.html"];
+            accessURL = [NSURL fileURLWithPath:NSTemporaryDirectory()];
+        }
+        if (sSettings.enableSquared) {
+            NSString *htmlDir = [tmpPath stringByDeletingLastPathComponent];
+            NSString *resDir  = [NSString stringWithUTF8String:sResourcesDir.c_str()];
+            accessURL = [NSURL fileURLWithPath:commonAncestorDir(htmlDir, resDir)];
+        }
+        if (!sExportTempHtmlPath.empty())
+            [[NSFileManager defaultManager] removeItemAtPath:
+                [NSString stringWithUTF8String:sExportTempHtmlPath.c_str()] error:nil];
+        sExportTempHtmlPath = std::string([tmpPath UTF8String]);
+
+        NSString *htmlStr = [NSString stringWithUTF8String:sFullTemplate.c_str()];
+        [htmlStr writeToFile:tmpPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        sExportNavDone = false;
+        [sExportWebView loadFileURL:[NSURL fileURLWithPath:tmpPath] allowingReadAccessToURL:accessURL];
+    }
+}
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Pump the main run loop until cond() is true or `timeout` seconds pass. WebKit
+// load/render/createPDF are all async; this keeps the command effectively
+// synchronous without deadlocking (the run loop still services WebKit).
+static bool pumpUntil(NSTimeInterval timeout, bool (^cond)(void)) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while ([deadline timeIntervalSinceNow] > 0) {
+        if (cond()) return true;
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                 beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+    }
+    return cond();
+}
+
+// True while the host is replaying a macro (so we suppress modal prompts that
+// would stall a batch run). Read defensively via KVC — the plugin doesn't link
+// the host's NppApplication header.
+static bool isMacroPlayingBack() {
+    @try {
+        if ([NSApp respondsToSelector:@selector(playingBackMacro)]) {
+            id v = [NSApp valueForKey:@"playingBackMacro"];
+            return [v respondsToSelector:@selector(boolValue)] && [v boolValue];
+        }
+    } @catch (__unused NSException *e) {}
+    return false;
+}
+
+// "Diagrams have settled": no squared block still pending AND every mermaid node
+// carries its rendered <svg>. Files without diagrams satisfy this immediately.
+static NSString *const kExportSettleJS =
+    @"(function(){if(document.querySelector('pre.squared-pending'))return false;"
+     "var m=document.querySelectorAll('.mermaid');"
+     "for(var i=0;i<m.length;i++){if(!m[i].querySelector('svg'))return false;}return true;})()";
+
+// Clone the document, strip the (heavy) <script> tags, inline every <img> as a
+// data: URI, and return a self-contained HTML string. Operates on a CLONE so the
+// live preview DOM is never mutated. Async (fetch) → callAsyncJavaScript.
+static NSString *const kExportInlineHtmlJS =
+    @"const clone = document.documentElement.cloneNode(true);"
+     "clone.querySelectorAll('script').forEach(s => s.remove());"
+     "const imgs = Array.from(clone.querySelectorAll('img'));"
+     "for (const img of imgs) { try {"
+     "  const s = img.getAttribute('src');"
+     "  if (s && !s.startsWith('data:')) {"
+     "    const abs = new URL(s, document.baseURI).href;"
+     "    const resp = await fetch(abs); const blob = await resp.blob();"
+     "    const durl = await new Promise((res, rej) => { const fr = new FileReader();"
+     "      fr.onloadend = () => res(fr.result); fr.onerror = rej; fr.readAsDataURL(blob); });"
+     "    img.setAttribute('src', durl);"
+     "  }"
+     "} catch (e) {} }"
+     "return '<!DOCTYPE html>\\n' + clone.outerHTML;";
+
+// Render the CURRENT editor buffer into sWebView and wait (bounded) until the
+// markdown + any async diagrams have settled. A fresh template load must already
+// be in flight (the caller called togglePanel/loadTemplateIntoWebView).
+static bool exportRenderCurrentAndSettle() {
+    if (!sExportWebView) return false;
+    if (!pumpUntil(15.0, ^bool{ return sExportNavDone; })) return false;   // template loaded
+
+    std::string text = getEditorText();
+    std::string ext = getCurrentExtension();
+    if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
+    for (auto &c : ext) c = (char)tolower((unsigned char)c);
+    if (ext == "mmd") text = "```mermaid\n" + text + "\n```\n";   // standalone diagram file
+
+    NSString *nsText = [NSString stringWithUTF8String:text.c_str()] ?: @"";
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:@[nsText] options:0 error:nil];
+    if (!jd) return false;
+    NSString *arr = [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding];
+    NSString *esc = [arr substringWithRange:NSMakeRange(1, arr.length - 2)];  // ["x"] → "x"
+    NSString *js  = [NSString stringWithFormat:@"renderMarkdown(%@);", esc];
+
+    __block bool rendered = false;
+    [sExportWebView evaluateJavaScript:js completionHandler:^(id r, NSError *e){ rendered = true; }];
+    if (!pumpUntil(15.0, ^bool{ return rendered; })) return false;
+
+    // Best-effort wait for the async diagram engines (squared worker / mermaid).
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:8.0];
+    __block int settled = -1; __block bool inFlight = false;
+    while ([deadline timeIntervalSinceNow] > 0) {
+        if (settled == 1) break;
+        if (!inFlight) {
+            inFlight = true; settled = -1;
+            [sExportWebView evaluateJavaScript:kExportSettleJS completionHandler:^(id res, NSError *e){
+                settled = (e) ? 1 : ([res respondsToSelector:@selector(boolValue)] && [res boolValue] ? 1 : 0);
+                inFlight = false;
+            }];
+        }
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                 beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    }
+    return true;   // proceed to capture even if diagrams didn't fully settle
+}
+
+// Capture the rendered preview as self-contained HTML → destURL.
+static bool exportCaptureHtml(NSURL *destURL) {
+    __block bool done = false, ok = false;
+    if (@available(macOS 11.0, *)) {
+        [sExportWebView callAsyncJavaScript:kExportInlineHtmlJS
+                            arguments:nil
+                              inFrame:nil
+                       inContentWorld:WKContentWorld.pageWorld
+                    completionHandler:^(id result, NSError *error){
+            if ([result isKindOfClass:[NSString class]]) {
+                NSError *werr = nil;
+                ok = [(NSString *)result writeToURL:destURL atomically:YES
+                                           encoding:NSUTF8StringEncoding error:&werr];
+                if (!ok) NSLog(@"[MarkdownPanel] HTML write failed: %@", werr);
+            } else {
+                NSLog(@"[MarkdownPanel] HTML capture failed: %@", error);
+            }
+            done = true;
+        }];
+    } else { done = true; }
+    pumpUntil(20.0, ^bool{ return done; });
+    return ok;
+}
+
+// Write `webView`'s rendered content as a PAGINATED US-Letter PDF to destURL via
+// WebKit's print path (reflows to the printable width + paginates down real
+// pages, instead of one long continuous page). WKWebView requires the
+// modal-for-window variant — the plain -runOperation runs away (huge invalid
+// file, never returns) — so it's async; we pump until the delegate fires. Shared
+// by the silent menu export and the toolbar "Save as PDF". No host changes.
+static bool writePaginatedPdf(WKWebView *webView, NSWindow *hostWindow, NSURL *destURL) {
+    if (!webView || !hostWindow) return false;
+    @autoreleasepool {
+        NSPrintInfo *info = [[NSPrintInfo sharedPrintInfo] copy];
+        info.paperSize    = NSMakeSize(612.0, 792.0);   // US Letter, 8.5" × 11" @ 72pt/in
+        info.orientation  = NSPaperOrientationPortrait;
+        info.topMargin = 36; info.bottomMargin = 36; info.leftMargin = 36; info.rightMargin = 36;  // 0.5"
+        info.horizontalPagination = NSPrintingPaginationModeFit;        // fit to page width, don't clip
+        info.verticalPagination   = NSPrintingPaginationModeAutomatic;  // paginate down across pages
+        NSMutableDictionary *d = [info dictionary];
+        d[NSPrintJobDisposition] = NSPrintSaveJob;      // save to file (no printer, no dialog)
+        d[NSPrintJobSavingURL]   = destURL;
+
+        NSPrintOperation *op = [webView printOperationWithPrintInfo:info];
+        op.showsPrintPanel    = NO;
+        op.showsProgressPanel = NO;
+        op.jobTitle           = [[destURL lastPathComponent] stringByDeletingPathExtension];
+
+        if (!sPrintDelegate) sPrintDelegate = [[_NMPPrintDelegate alloc] init];
+        sPrintDone = false; sPrintOK = NO;
+        [op runOperationModalForWindow:hostWindow
+                              delegate:sPrintDelegate
+                        didRunSelector:@selector(printOp:success:contextInfo:)
+                           contextInfo:NULL];
+        pumpUntil(60.0, ^bool{ return sPrintDone; });
+        if (!sPrintOK) NSLog(@"[MarkdownPanel] PDF print/save failed for %@", destURL);
+        return sPrintOK;
+    }
+}
+
+// Silent menu/batch export: the hidden off-screen export WebView → paginated PDF.
+static bool exportCapturePdf(NSURL *destURL) {
+    return writePaginatedPdf(sExportWebView, sExportWindow, destURL);
+}
+
+// Menu/macro entry point: export the current file next to the source, silently.
+static void exportCurrentFile(bool wantPDF) {
+    if (sExporting) return;   // never re-enter (nested run-loop pumps)
+    @autoreleasepool {
+        std::string fp = getCurrentFilePath();
+        if (fp.empty()) {     // untitled/unsaved → skip with a (non-blocking) warning
+            if (isMacroPlayingBack()) {
+                NSLog(@"[MarkdownPanel] Export skipped: current buffer is unsaved.");
+            } else {
+                NSAlert *a = [[NSAlert alloc] init];
+                a.messageText = @"Export skipped";
+                a.informativeText = @"Save the file before exporting it to HTML or PDF.";
+                [a addButtonWithTitle:@"OK"];
+                [a runModal];
+            }
+            return;
+        }
+
+        NSString *src  = [NSString stringWithUTF8String:fp.c_str()];
+        NSString *stem = [src stringByDeletingPathExtension];
+        NSURL *destURL = [NSURL fileURLWithPath:
+            [stem stringByAppendingPathExtension:(wantPDF ? @"pdf" : @"html")]];
+
+        if (sFullTemplate.empty()) buildTemplate();
+        if (sFullTemplate.empty()) {   // resources missing → nothing to render
+            NSLog(@"[MarkdownPanel] Export aborted: render template unavailable.");
+            return;
+        }
+
+        sExporting = true;
+        ensureExportWebView();               // hidden off-screen host window (created once)
+        loadTemplateIntoExportWebView();     // panel-independent render
+
+        bool ok = false;
+        if (exportRenderCurrentAndSettle())
+            ok = wantPDF ? exportCapturePdf(destURL) : exportCaptureHtml(destURL);
+
+        sExporting = false;
+
+        NSLog(@"[MarkdownPanel] Export %@ → %@ : %@", wantPDF ? @"PDF" : @"HTML",
+              destURL.path, ok ? @"OK" : @"FAILED");
+    }
+}
+
+static void exportCurrentToHtmlCmd() { exportCurrentFile(false); }
+static void exportCurrentToPdfCmd()  { exportCurrentFile(true);  }
 
 // Live controller for the Settings dialog: gates the theme radios on the
 // "Enable Squared flow diagrams" checkbox. Radio-group exclusivity is handled
@@ -2001,11 +2318,15 @@ extern "C" NPP_EXPORT void setInfo(NppData data) {
     addItem("Synchronize with caret position",      syncWithCaretCmd);   // 2
     addItem("Synchronize with first visible line",  syncWithFirstVisibleLineCmd); // 3
     addSep();                                                             // 4
-    addItem("Settings",                             showSettingsCmd);     // 5
-    addItem("Help",                                 showHelpCmd);         // 6
-    addItem("About",                                showAboutCmd);        // 7
+    addItem("Export to HTML",                       exportCurrentToHtmlCmd); // 5
+    addItem("Export to PDF",                        exportCurrentToPdfCmd);  // 6
+    addSep();                                                             // 7
+    addItem("Settings",                             showSettingsCmd);     // 8
+    addItem("Help",                                 showHelpCmd);         // 9
+    addItem("About",                                showAboutCmd);        // 10
 
-    // Set initial checkmarks for sync modes
+    // Set initial checkmarks for sync modes (indices 2/3 unchanged by the
+    // export items inserted after the separator, so these stay correct).
     funcItem[2]._init2Check = sSettings.syncWithCaret;
     funcItem[3]._init2Check = sSettings.syncWithFirstVisibleLine;
 }
