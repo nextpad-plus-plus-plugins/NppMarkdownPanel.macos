@@ -44,6 +44,7 @@ struct MarkdownSettings {
     bool enableMermaid = false;
     bool enableSquared = false;              // render mermaid flowcharts in the "squared" style
     std::string squaredTheme = "boardroom";  // boardroom | linen | blueprint
+    bool syncPreviewToEditor = false;        // reverse sync: scrolling the preview scrolls the editor
 };
 
 static MarkdownSettings sSettings;
@@ -58,6 +59,15 @@ static MarkdownSettings sSettings;
 // (floating fallback for older hosts without the docking API).
 static NSView       *sContentView  = nil;
 static WKWebView    *sWebView      = nil;
+
+// Image cache-buster generation. WKWebView's WebContent process serves
+// file:// <img> subresources from an in-process memory cache keyed by URL,
+// so an image edited on disk keeps rendering stale until its URL changes.
+// Every render passes this generation to the page (window._imgGen) and the
+// JS appends ?v=<gen> to local img URLs. Bumped on template (re)loads —
+// which covers the Refresh button — and when the app becomes active again
+// (the "edited the image in another app, switched back" case).
+static long          sImageGeneration = 0;
 
 // Docking state. Exactly one of these is active after first show:
 //   g_panelHandle > 0  → host accepted NPPM_DMM_REGISTERPANEL; docked path
@@ -94,6 +104,10 @@ static void showAboutCmd();
 static void exportToHtmlCmd();
 static void renderMarkdownDirect();
 static void renderMarkdownDeferred();
+// Preview → editor bridge (WKScriptMessageHandler callbacks)
+static void applyPreviewScrollToEditor(intptr_t docLine);
+static void locateWordFromPreview(NSString *word, intptr_t startLine,
+                                  intptr_t endLine, intptr_t occ);
 static void ensureContentView();
 static bool writePaginatedPdf(WKWebView *webView, NSWindow *hostWindow, NSURL *destURL);
 static NSPanel *ensureFloatingPanel();
@@ -432,6 +446,22 @@ function renderMarkdown(md) {
 
   document.getElementById('content').innerHTML = html;
 
+  // Cache-bust local images. WebKit's memory cache serves file:// images
+  // by URL for the lifetime of the web process, so an image edited on disk
+  // never refreshes while its URL stays the same. Native code bumps
+  // window._imgGen on template reloads and app re-activation; appending
+  // ?v=<gen> makes the URL a fresh cache key (the file loader ignores the
+  // query when reading the file). Remote and data: URLs are left alone,
+  // and gen 0 (never bumped) keeps pristine URLs.
+  var _gen = window._imgGen || 0;
+  if (_gen > 0) {
+    document.querySelectorAll('#content img').forEach(function(img) {
+      var src = img.getAttribute('src') || '';
+      if (!src || /^(https?|data):/i.test(src)) return;
+      img.setAttribute('src', src + (src.indexOf('?') >= 0 ? '&' : '?') + 'v=' + _gen);
+    });
+  }
+
   // Build the source-line → block-id map used by scrollToLine() for
   // line-accurate forward scroll sync. The post-process regex above
   // assigns block-N ids in DOM order; marked.lexer walks the source
@@ -732,6 +762,13 @@ function scrollToLine(lineNo) {
       var ratio = Math.max(0, Math.min(1, lineNo / (window._totalLines - 1)));
       targetY = Math.round(ratio * maxScroll);
     }
+    // Mask this programmatic scroll from the reverse-sync reporter: smooth
+    // scrolling emits a stream of scroll events until it settles, and none
+    // of them may be echoed back to the editor (feedback-loop guard #2).
+    if (Math.abs(window.scrollY - targetY) > 2) {
+      window._progTargetY = targetY;
+      window._progTargetTs = Date.now();
+    }
     window.scrollTo({ top: targetY, behavior: 'smooth' });
     _scrollTimer = null;
   }, 50);
@@ -741,6 +778,123 @@ function scrollToLine(lineNo) {
 function scrollToTop() {
   window.scrollTo({top: 0, behavior: 'smooth'});
 }
+
+// ───────────────── Preview → editor bridge ─────────────────
+// Posts { type:'scroll', line } while the USER scrolls the preview, and
+// { type:'wordTap', ... } on double-click. Feedback-loop protection is
+// layered on both sides of the bridge:
+//   JS  #1: positive intent gate — nothing is reported unless real input
+//           (wheel / scrollbar mousedown / keydown) happened in the last
+//           300 ms; programmatic scrolls produce none of these.
+//   JS  #2: scrollToLine() masks its own smooth-scroll event stream via
+//           window._progTargetY until the target settles (or 700 ms).
+//   Native: applyPreviewScrollToEditor() pre-updates the forward-sync
+//           trackers and keeps a ±1-line dead-band (see the .mm side).
+var _bridge = (window.webkit && window.webkit.messageHandlers)
+                ? window.webkit.messageHandlers.nppmd : null;
+window._progTargetY  = null;
+window._progTargetTs = 0;
+var _lastUserInputTs = 0;
+['wheel', 'mousedown', 'keydown'].forEach(function(evt) {
+  window.addEventListener(evt, function() { _lastUserInputTs = Date.now(); },
+                          { passive: true, capture: true });
+});
+
+// Inverse of _resolveBlockTargetY: current scroll Y → source line, using the
+// same blockMap with interpolation between block tops (proportional fallback
+// when the map is empty).
+function _lineFromScrollY(y) {
+  var bm = window._blockMap || [];
+  var maxScroll = Math.max(1,
+    document.documentElement.scrollHeight - window.innerHeight);
+  var total = (window._totalLines || 1) - 1;
+  if (!bm.length) {
+    return Math.round(Math.max(0, Math.min(1, y / maxScroll)) * total);
+  }
+  var lo = 0, hi = bm.length - 1, k = 0;
+  while (lo <= hi) {
+    var mid = (lo + hi) >> 1;
+    var el = document.getElementById(bm[mid].id);
+    var top = el ? el.offsetTop : 0;
+    if (top <= y) { k = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  var elK = document.getElementById(bm[k].id);
+  if (!elK) return bm[k].line;
+  var topK = elK.offsetTop;
+  var line = bm[k].line;
+  if (k + 1 < bm.length) {
+    var elN = document.getElementById(bm[k + 1].id);
+    if (elN && elN.offsetTop > topK) {
+      var t = Math.max(0, Math.min(1, (y - topK) / (elN.offsetTop - topK)));
+      line = bm[k].line + t * (bm[k + 1].line - bm[k].line);
+    }
+  } else if (maxScroll > topK) {
+    var t2 = Math.max(0, Math.min(1, (y - topK) / (maxScroll - topK)));
+    line = bm[k].line + t2 * (total - bm[k].line);
+  }
+  return Math.max(0, Math.round(line));
+}
+
+var _revScrollTimer = null;
+window.addEventListener('scroll', function() {
+  if (!_bridge) return;
+  var y = window.scrollY;
+  if (window._progTargetY !== null) {          // guard #2: our own smooth scroll
+    if (Math.abs(y - window._progTargetY) <= 2 ||
+        Date.now() - window._progTargetTs > 700) {
+      window._progTargetY = null;
+    }
+    return;
+  }
+  if (Date.now() - _lastUserInputTs > 300) return;   // guard #1: no user intent
+  if (_revScrollTimer) clearTimeout(_revScrollTimer);
+  _revScrollTimer = setTimeout(function() {
+    _revScrollTimer = null;
+    _bridge.postMessage({ type: 'scroll', line: _lineFromScrollY(window.scrollY) });
+  }, 100);
+}, { passive: true });
+
+// Double-click a word in the preview → select it in the source. Always on
+// (explicit gesture, no loop potential). Best-effort by design: preview
+// text differs from source text inside link labels/emphasis, so native
+// falls back from "same occurrence" to "first occurrence in the block".
+document.addEventListener('dblclick', function() {
+  if (!_bridge) return;
+  var sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+  var word = sel.toString().trim();
+  if (!word || word.length > 200 || /\s/.test(word)) return;
+  var node = sel.anchorNode;
+  var el = (node && node.nodeType === 3) ? node.parentElement : node;
+  if (!el || !el.closest) return;
+  if (el.closest('svg, .mermaid')) return;      // diagrams have no text mapping
+  var block = el.closest('[id^="block-"]');
+  if (!block) return;
+  var bm = window._blockMap || [];
+  var idx = -1;
+  for (var i = 0; i < bm.length; i++) {
+    if (bm[i].id === block.id) { idx = i; break; }
+  }
+  if (idx < 0) return;
+  var startLine = bm[idx].line;
+  var endLine = (idx + 1 < bm.length)
+                  ? Math.max(startLine, bm[idx + 1].line - 1)
+                  : ((window._totalLines || startLine + 1) - 1);
+  // Count occurrences of the word in this block BEFORE the selection, so
+  // native can pick the matching occurrence in the source range.
+  var occ = 0;
+  try {
+    var r = sel.getRangeAt(0);
+    var pre = document.createRange();
+    pre.selectNodeContents(block);
+    pre.setEnd(r.startContainer, r.startOffset);
+    var esc = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    var m = pre.toString().match(new RegExp(esc, 'g'));
+    occ = m ? m.length : 0;
+  } catch (e) { occ = 0; }
+  _bridge.postMessage({ type: 'wordTap', word: word,
+                        startLine: startLine, endLine: endLine, occ: occ });
+}, true);
 
 // Initialize mermaid if available
 if (typeof mermaid !== 'undefined') {
@@ -798,6 +952,7 @@ static void loadSettings() {
         if ((v = dict[@"enableMermaid"])) sSettings.enableMermaid = [v boolValue];
         if ((v = dict[@"enableSquared"])) sSettings.enableSquared = [v boolValue];
         if ((s = dict[@"squaredTheme"])) sSettings.squaredTheme = [s UTF8String];
+        if ((v = dict[@"syncPreviewToEditor"])) sSettings.syncPreviewToEditor = [v boolValue];
 
         // Migration: ensure .mmd is in the supported extensions list
         {
@@ -838,6 +993,7 @@ static void saveSettings() {
             @"enableMermaid": @(sSettings.enableMermaid),
             @"enableSquared": @(sSettings.enableSquared),
             @"squaredTheme": @(sSettings.squaredTheme.c_str()),
+            @"syncPreviewToEditor": @(sSettings.syncPreviewToEditor),
         };
         NSData *data = [NSJSONSerialization dataWithJSONObject:dict
                                                       options:NSJSONWritingPrettyPrinted error:nil];
@@ -1174,6 +1330,41 @@ static void printMarkdownPreview() {
 
 static MarkdownNavigationDelegate *sNavDelegate = nil;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// JS → native bridge. The template posts to window.webkit.messageHandlers.
+// nppmd; WebKit delivers on the main thread. Two message types today:
+//   { type:'scroll',  line }                      — reverse scroll sync
+//   { type:'wordTap', word, startLine, endLine, occ } — double-click locate
+// ─────────────────────────────────────────────────────────────────────────────
+@interface _NMPScriptBridge : NSObject <WKScriptMessageHandler>
+@end
+
+@implementation _NMPScriptBridge
+- (void)userContentController:(WKUserContentController *)ucc
+      didReceiveScriptMessage:(WKScriptMessage *)message {
+    (void)ucc;
+    NSDictionary *body = [message.body isKindOfClass:[NSDictionary class]]
+                             ? (NSDictionary *)message.body : nil;
+    if (!body) return;
+    NSString *type = [body[@"type"] isKindOfClass:[NSString class]] ? body[@"type"] : nil;
+    if ([type isEqualToString:@"scroll"]) {
+        NSNumber *line = [body[@"line"] isKindOfClass:[NSNumber class]] ? body[@"line"] : nil;
+        if (line) applyPreviewScrollToEditor((intptr_t)line.integerValue);
+    } else if ([type isEqualToString:@"wordTap"]) {
+        NSString *word = [body[@"word"] isKindOfClass:[NSString class]] ? body[@"word"] : nil;
+        NSNumber *s = [body[@"startLine"] isKindOfClass:[NSNumber class]] ? body[@"startLine"] : nil;
+        NSNumber *e = [body[@"endLine"]   isKindOfClass:[NSNumber class]] ? body[@"endLine"]   : nil;
+        NSNumber *o = [body[@"occ"]       isKindOfClass:[NSNumber class]] ? body[@"occ"]       : nil;
+        if (word && s && e)
+            locateWordFromPreview(word, (intptr_t)s.integerValue,
+                                  (intptr_t)e.integerValue,
+                                  o ? (intptr_t)o.integerValue : 0);
+    }
+}
+@end
+
+static _NMPScriptBridge *sScriptBridge = nil;
+
 // Build (once) the NSView that wraps the search/print toolbar row + the
 // WKWebView. Used by both the docked path (registered via
 // NPPM_DMM_REGISTERPANEL) and the floating fallback (installed as the
@@ -1255,6 +1446,14 @@ static void ensureContentView() {
         @try { [config.preferences setValue:@YES forKey:@"allowFileAccessFromFileURLs"]; } @catch (id e) {}
         @try { [config setValue:@YES forKey:@"allowUniversalAccessFromFileURLs"]; } @catch (id e) {}
 
+        // JS → native message channel (reverse scroll sync + double-click
+        // word locate). The controller retains the handler; sScriptBridge
+        // lives for the plugin's lifetime, matching sNavDelegate.
+        sScriptBridge = [[_NMPScriptBridge alloc] init];
+        WKUserContentController *ucc = [[WKUserContentController alloc] init];
+        [ucc addScriptMessageHandler:sScriptBridge name:@"nppmd"];
+        config.userContentController = ucc;
+
         sWebView = [[WKWebView alloc] initWithFrame:NSZeroRect
                                        configuration:config];
         sWebView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1266,6 +1465,24 @@ static void ensureContentView() {
         sWebView.navigationDelegate = sNavDelegate;
 
         [sContentView addSubview:sWebView];
+
+        // "Edited the image in another app and switched back" — the moment
+        // stale images are actually noticed. Bump the cache-buster and
+        // re-render on every app re-activation; when nothing referenced
+        // changed this costs one debounced render of unchanged HTML plus a
+        // re-read of the (small) local images. Registered once — this block
+        // runs under the `if (sContentView) return;` creation guard.
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:NSApplicationDidBecomeActiveNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+            (void)note;
+            if (!sPanelVisible || !sWebView || !sWebViewReady) return;
+            sImageGeneration++;
+            sLastRenderedText.clear();   // defeat the no-change early-out
+            renderMarkdownDeferred();
+        }];
 
         // ── Constraints ────────────────────────────────────────────────
         [NSLayoutConstraint activateConstraints:@[
@@ -1391,6 +1608,11 @@ static BOOL markdownPanelIsShown() {
 
 static void loadTemplateIntoWebView() {
     if (!sWebView || sFullTemplate.empty()) return;
+
+    // New navigation, same WebContent process → same memory cache. Bump the
+    // image generation so this page's renders re-fetch local images (covers
+    // the Refresh button, file switches, and settings reloads).
+    sImageGeneration++;
 
     @autoreleasepool {
         // Write the HTML into the SAME directory as the markdown file so that
@@ -1518,7 +1740,8 @@ static void renderMarkdownDirect() {
         // Remove leading [ and trailing ]
         NSString *jsonEscaped = [jsonArray substringWithRange:NSMakeRange(1, jsonArray.length - 2)];
 
-        NSString *js = [NSString stringWithFormat:@"renderMarkdown(%@);", jsonEscaped];
+        NSString *js = [NSString stringWithFormat:@"window._imgGen=%ld; renderMarkdown(%@);",
+                                                  sImageGeneration, jsonEscaped];
         [sWebView evaluateJavaScript:js completionHandler:nil];
     }
 }
@@ -1609,6 +1832,97 @@ static void syncScroll() {
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), sPendingScroll);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reverse sync: the preview reported a user scroll → move the editor.
+// Feedback-loop guards on this side (the JS side has its own two):
+//   - dead-band: a move of ≤1 doc line is quantization noise from the
+//     pixel→line interpolation, not intent — applying it would let the two
+//     panes "correct" each other in a limit cycle;
+//   - tracker pre-update: refresh sLastCaretLine/sLastFirstVisibleLine with
+//     the values the imminent SCN_UPDATEUI will observe, so syncScroll()
+//     sees "no change" and does not echo this scroll back into the preview.
+// ─────────────────────────────────────────────────────────────────────────────
+static void applyPreviewScrollToEditor(intptr_t docLine) {
+    if (!sSettings.syncPreviewToEditor) return;
+    if (!sPanelVisible) return;
+    NppHandle h = getCurScintilla();
+    if (!h) return;
+
+    intptr_t lineCount = sci(h, SCI_GETLINECOUNT);
+    if (lineCount <= 0) return;
+    if (docLine < 0) docLine = 0;
+    if (docLine > lineCount - 1) docLine = lineCount - 1;
+
+    intptr_t curVis = sci(h, SCI_GETFIRSTVISIBLELINE);
+    intptr_t curDoc = sci(h, SCI_DOCLINEFROMVISIBLE, (uintptr_t)curVis);
+    if (docLine >= curDoc - 1 && docLine <= curDoc + 1) return;   // dead-band
+
+    // Doc line → visible line handles word wrap and folds.
+    intptr_t vis = sci(h, SCI_VISIBLEFROMDOCLINE, (uintptr_t)docLine);
+    sci(h, SCI_SETFIRSTVISIBLELINE, (uintptr_t)vis);
+
+    // Read BACK what Scintilla actually applied (it may clamp near EOF) so
+    // the tracker matches exactly what the next SCN_UPDATEUI will report.
+    intptr_t actualVis = sci(h, SCI_GETFIRSTVISIBLELINE);
+    sLastFirstVisibleLine = sci(h, SCI_DOCLINEFROMVISIBLE, (uintptr_t)actualVis);
+    intptr_t pos = sci(h, SCI_GETCURRENTPOS);
+    sLastCaretLine = sci(h, SCI_LINEFROMPOSITION, (uintptr_t)pos);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Double-click in the preview: select `word` in the source, preferring the
+// occ-th occurrence within the block's source-line range [startLine,endLine]
+// (occ = occurrences seen before the clicked one in the preview block).
+// Preview text ≠ source text inside link labels/emphasis, so this degrades
+// deliberately: exact occurrence → last found in range → silent no-op.
+// ─────────────────────────────────────────────────────────────────────────────
+static void locateWordFromPreview(NSString *word, intptr_t startLine,
+                                  intptr_t endLine, intptr_t occ) {
+    if (!sPanelVisible || word.length == 0) return;
+    NppHandle h = getCurScintilla();
+    if (!h) return;
+
+    intptr_t lineCount = sci(h, SCI_GETLINECOUNT);
+    if (lineCount <= 0) return;
+    if (startLine < 0) startLine = 0;
+    if (startLine > lineCount - 1) startLine = lineCount - 1;
+    if (endLine < startLine) endLine = startLine;
+    if (endLine > lineCount - 1) endLine = lineCount - 1;
+
+    const char *needle = word.UTF8String;
+    if (!needle || !*needle) return;
+    intptr_t needleLen = (intptr_t)strlen(needle);
+
+    intptr_t rangeStart = sci(h, SCI_POSITIONFROMLINE, (uintptr_t)startLine);
+    intptr_t rangeEnd   = sci(h, SCI_GETLINEENDPOSITION, (uintptr_t)endLine);
+    if (rangeEnd <= rangeStart) return;
+
+    sci(h, SCI_SETSEARCHFLAGS, SCFIND_MATCHCASE);
+    intptr_t foundStart = -1, foundEnd = -1;
+    intptr_t searchPos = rangeStart;
+    for (intptr_t i = 0; searchPos < rangeEnd; i++) {
+        sci(h, SCI_SETTARGETSTART, (uintptr_t)searchPos);
+        sci(h, SCI_SETTARGETEND, (uintptr_t)rangeEnd);
+        intptr_t hit = sci(h, SCI_SEARCHINTARGET, (uintptr_t)needleLen, (intptr_t)needle);
+        if (hit < 0) break;
+        foundStart = hit;
+        foundEnd   = sci(h, SCI_GETTARGETEND);
+        if (i == occ) break;                 // reached the matching occurrence
+        searchPos = foundEnd;
+    }
+    if (foundStart < 0) return;              // nothing in range — stay silent
+
+    sci(h, SCI_SETSEL, (uintptr_t)foundStart, (intptr_t)foundEnd);
+    sci(h, SCI_SCROLLCARET);
+
+    // The user is already looking at the right block in the preview — keep
+    // the forward sync from scrolling it again (same tracker trick as above).
+    intptr_t pos = sci(h, SCI_GETCURRENTPOS);
+    sLastCaretLine = sci(h, SCI_LINEFROMPOSITION, (uintptr_t)pos);
+    intptr_t curVis = sci(h, SCI_GETFIRSTVISIBLELINE);
+    sLastFirstVisibleLine = sci(h, SCI_DOCLINEFROMVISIBLE, (uintptr_t)curVis);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2191,6 +2505,13 @@ static void showSettingsCmd() {
         [cv addSubview:themeBlueprint];
         ctl.squaredCheck = squaredCheck;
         ctl.themeRadios  = @[themeBoardroom, themeLinen, themeBlueprint];
+        y -= 34;
+
+        NSButton *syncPrevCheck = [NSButton checkboxWithTitle:@"Synchronize editor when scrolling preview"
+                                                        target:nil action:nil];
+        syncPrevCheck.frame = NSMakeRect(20, y, 380, 20);
+        syncPrevCheck.state = sSettings.syncPreviewToEditor ? NSControlStateValueOn : NSControlStateValueOff;
+        [cv addSubview:syncPrevCheck];
         y -= 40;
 
         // Save button
@@ -2225,6 +2546,7 @@ static void showSettingsCmd() {
         std::string newTheme = themeLinen.state == NSControlStateValueOn ? "linen"
                              : themeBlueprint.state == NSControlStateValueOn ? "blueprint" : "boardroom";
         if (newTheme != sSettings.squaredTheme) { sSettings.squaredTheme = newTheme; needsReload = true; }
+        sSettings.syncPreviewToEditor = syncPrevCheck.state == NSControlStateValueOn;
 
         // Update checkmarks
         npp(NPPM_SETMENUITEMCHECK, (uintptr_t)funcItem[2]._cmdID, sSettings.syncWithCaret ? 1 : 0);
