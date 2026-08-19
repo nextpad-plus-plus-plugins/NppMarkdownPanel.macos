@@ -1,12 +1,17 @@
-
-.DS_Store
-.npp-md-preview.html
-/tmp
-# CMake build output
 # macOS metadata
-# Scratch / investigation notes
-# Temp preview files created alongside markdown files
+.DS_Store
+
+# CMake build output
 build/
+
+# Release zips (published as GitHub release assets, not tracked)
 dist/
+
 docs/
 tools/
+
+# Scratch / investigation notes
+/tmp
+
+# Temp preview files created alongside markdown files
+.npp-md-preview.html
