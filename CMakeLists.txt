@@ -27,6 +27,7 @@ install(TARGETS NppMarkdownPanel DESTINATION "${PLUGIN_INSTALL_DIR}")
 # Vendor JS/CSS/icons + help.md the runtime reads from <dylib_dir>/resources/.
 # Without this `make install` only deploys the dylib and the plugin fails
 # silently at first preview render (marked.js missing).
+# Includes resources/katex/ (katex.min.js, CSS, fonts) for math.
 install(DIRECTORY resources/ DESTINATION "${PLUGIN_INSTALL_DIR}/resources"
     PATTERN ".DS_Store"  EXCLUDE
     PATTERN ".gitignore" EXCLUDE)
