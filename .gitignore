@@ -10,8 +10,10 @@ dist/
 docs/
 tools/
 
+
 # Scratch / investigation notes
 /tmp
 
 # Temp preview files created alongside markdown files
 .npp-md-preview.html
+build-*/
