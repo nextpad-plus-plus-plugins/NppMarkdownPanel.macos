@@ -1944,6 +1944,22 @@ static void togglePanel() {
                                           (intptr_t)"Markdown Panel");
         if (h > 0) {
             g_panelHandle = (uint64_t)h;
+
+            // Declare restore metadata (NPPM_DMM_SETPANELINFO, host ≥ 1.1.0)
+            // so a panel visible at quit reopens at the next launch via
+            // "Toggle Markdown Panel" (cmdIndex 0 — this toggle itself).
+            // Older hosts return 0; ignored.
+#ifndef NPPM_DMM_SETPANELINFO
+            // Local copy, matches the host's NppPluginInterfaceMac.h (this
+            // repo's bundled header predates the message).
+            typedef struct { const char *moduleName; int32_t cmdIndex; } NppPanelInfo;
+#define NPPM_DMM_SETPANELINFO (NPPMSG + 505)
+#endif
+            NppPanelInfo info;
+            info.moduleName = "NppMarkdownPanel";
+            info.cmdIndex   = 0;
+            nppData._sendMessage(nppData._nppHandle, NPPM_DMM_SETPANELINFO,
+                                 (uintptr_t)g_panelHandle, (intptr_t)&info);
         } else {
             ensureFloatingPanel();
         }
