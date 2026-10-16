@@ -2,7 +2,7 @@
  * NppMarkdownPanel — macOS port
  *
  * Real-time Markdown preview panel for Notepad++ macOS.
- * Uses WKWebView with marked.js + highlight.js for rendering.
+ * Uses WKWebView with marked.js + highlight.js + KaTeX for rendering.
  * Images with relative paths resolve natively via WKWebView's baseURL.
  *
  * Original Windows plugin by Jens Wollgarten (GPLv2)
@@ -44,6 +44,7 @@ struct MarkdownSettings {
     bool enableMermaid = false;
     bool enableSquared = false;              // render mermaid flowcharts in the "squared" style
     std::string squaredTheme = "boardroom";  // boardroom | linen | blueprint
+    bool enableMath = true;                  // KaTeX math ($...$, $$...$$, \(...\), \[...\])
     bool syncPreviewToEditor = false;        // reverse sync: scrolling the preview scrolls the editor
 };
 
@@ -193,6 +194,48 @@ static std::string readFileToString(const std::string &path) {
     }
 }
 
+// Rewrite KaTeX CSS `url(fonts/...)` → data: URIs so preview HTML does not need
+// filesystem read access to resources/katex/fonts (math-on must not widen
+// WKWebView allowingReadAccessToURL beyond the markdown directory).
+static std::string rewriteKatexCssFontUrls(const std::string &css,
+                                           const std::string &fontsDir) {
+    @autoreleasepool {
+        NSString *nsCss = [NSString stringWithUTF8String:css.c_str()];
+        if (!nsCss) return css;
+        NSString *dir = [NSString stringWithUTF8String:fontsDir.c_str()];
+        NSError *err = nil;
+        NSRegularExpression *re = [NSRegularExpression
+            regularExpressionWithPattern:@"url\\((['\"]?)fonts/([^)'\"]+)\\1\\)"
+                                 options:0 error:&err];
+        if (!re) return css;
+        NSArray<NSTextCheckingResult *> *matches =
+            [re matchesInString:nsCss options:0 range:NSMakeRange(0, nsCss.length)];
+        NSMutableString *out = [nsCss mutableCopy];
+        NSMutableDictionary<NSString *, NSString *> *cache = [NSMutableDictionary dictionary];
+        for (NSTextCheckingResult *m in [matches reverseObjectEnumerator]) {
+            NSString *name = [nsCss substringWithRange:[m rangeAtIndex:2]];
+            NSString *dataUri = cache[name];
+            if (!dataUri) {
+                NSString *path = [dir stringByAppendingPathComponent:name];
+                NSData *data = [NSData dataWithContentsOfFile:path];
+                if (!data) continue;  // leave original url if font missing
+                NSString *lower = [name lowercaseString];
+                NSString *mime = @"application/octet-stream";
+                if ([lower hasSuffix:@".woff2"]) mime = @"font/woff2";
+                else if ([lower hasSuffix:@".woff"]) mime = @"font/woff";
+                else if ([lower hasSuffix:@".ttf"]) mime = @"font/ttf";
+                else if ([lower hasSuffix:@".otf"]) mime = @"font/otf";
+                NSString *b64 = [data base64EncodedStringWithOptions:0];
+                dataUri = [NSString stringWithFormat:@"data:%@;base64,%@", mime, b64];
+                cache[name] = dataUri;
+            }
+            [out replaceCharactersInRange:m.range
+                               withString:[NSString stringWithFormat:@"url(%@)", dataUri]];
+        }
+        return std::string([out UTF8String]);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  HTML template composition
 // ═══════════════════════════════════════════════════════════════════════════
@@ -316,6 +359,24 @@ static void buildTemplate() {
             mermaidJS = readFileToString(sResourcesDir + "/mermaid.min.js");
         }
 
+        // Optional KaTeX (math). CSS font urls are inlined as data: URIs so
+        // math does not require widening WKWebView file read access.
+        std::string katexJS, katexCSS;
+        if (sSettings.enableMath) {
+            katexJS = readFileToString(sResourcesDir + "/katex/katex.min.js");
+            katexCSS = readFileToString(sResourcesDir + "/katex/katex.min.css");
+            if (!katexCSS.empty()) {
+                katexCSS = rewriteKatexCssFontUrls(
+                    katexCSS, sResourcesDir + "/katex/fonts");
+            }
+            if (katexJS.empty()) {
+                NSLog(@"[MarkdownPanel] WARNING: KaTeX assets missing under %s/katex",
+                      sResourcesDir.c_str());
+                katexJS.clear();
+                katexCSS.clear();
+            }
+        }
+
         std::string html = "<!DOCTYPE html>\n<html><head>\n<meta charset=\"utf-8\">\n";
         html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n";
 
@@ -326,6 +387,11 @@ static void buildTemplate() {
         // highlight.js light CSS (default)
         html += "<style media=\"(prefers-color-scheme: light)\">\n" + hljsLightCSS + "\n</style>\n";
         html += "<style media=\"(prefers-color-scheme: dark)\">\n" + hljsDarkCSS + "\n</style>\n";
+        if (!katexCSS.empty()) {
+            html += "<style>\n" + katexCSS + "\n</style>\n";
+            // KaTeX inherits body color; tighten display-math spacing a bit.
+            html += "<style>.katex{font-size:1.1em}.katex-display{margin:1em 0;overflow-x:auto;overflow-y:hidden}</style>\n";
+        }
 
         // Zoom
         html += "<style>body { zoom: " + std::to_string(sSettings.zoomLevel) + "%; }</style>\n";
@@ -341,6 +407,9 @@ static void buildTemplate() {
         }
         if (!mermaidJS.empty()) {
             html += "<script>\n" + mermaidJS + "\n</script>\n";
+        }
+        if (!katexJS.empty()) {
+            html += "<script>\n" + katexJS + "\n</script>\n";
         }
 
         // The "squared" diagram engine, loaded as a file:// ES module from the plugin
@@ -434,8 +503,264 @@ function renderMarkdown(md) {
       '</div>\n';
   }
 
+  // Protect math so marked.js does not mangle underscores / asterisks inside
+  // $...$ / $$...$$ / \(...\) / \[...\]. Fenced/indented/inline code is left
+  // alone (CommonMark fence-length matching). After parse, restore as
+  // <span class="npp-math"> only in HTML text nodes — never inside tags —
+  // then katex.render. Currency like $5 is not stashed (skip $digit).
+  // Keep an unprotected copy for scroll-sync block mapping (placeholders would
+  // collapse multi-line $$...$$ and shift source line numbers).
+  var contentForMap = content;
+  var _mathSlots = [];
+  var parseContent = content;
+  if (typeof katex !== 'undefined') {
+    function _stashMath(m) {
+      _mathSlots.push(m);
+      return '%%NPPMATH' + (_mathSlots.length - 1) + '%%';
+    }
+    function _lineEnd(src, from) {
+      var p = from;
+      while (p < src.length && src.charAt(p) !== '\n' && src.charAt(p) !== '\r') p++;
+      return p;
+    }
+    function _nextLine(src, lineEnd) {
+      var p = lineEnd;
+      if (src.charAt(p) === '\r') p++;
+      if (src.charAt(p) === '\n') p++;
+      return p;
+    }
+    function _skipSpaces(src, from, limit) {
+      var p = from;
+      while (p < src.length && p - from < limit && src.charAt(p) === ' ') p++;
+      return p;
+    }
+    function _runEnd(src, from, ch) {
+      var p = from;
+      while (p < src.length && src.charAt(p) === ch) p++;
+      return p;
+    }
+    // Return the content start after up to three spaces and repeated quote/list markers.
+    function _containerContentStart(src, line) {
+      var p = _skipSpaces(src, line, 3);
+      var markerFound = true;
+      while (markerFound) {
+        markerFound = false;
+        if (src.charAt(p) === '>') {
+          p++;
+          if (src.charAt(p) === ' ' || src.charAt(p) === '\t') p++;
+          p = _skipSpaces(src, p, 3);
+          markerFound = true;
+          continue;
+        }
+        var markerEnd = p;
+        var marker = src.charAt(markerEnd);
+        if (marker === '-' || marker === '+' || marker === '*') {
+          markerEnd++;
+        } else {
+          var digits = 0;
+          while (digits < 9 && /[0-9]/.test(src.charAt(markerEnd))) {
+            markerEnd++;
+            digits++;
+          }
+          if (digits && (src.charAt(markerEnd) === '.' || src.charAt(markerEnd) === ')'))
+            markerEnd++;
+          else
+            markerEnd = p;
+        }
+        if (markerEnd > p && (src.charAt(markerEnd) === ' ' || src.charAt(markerEnd) === '\t')) {
+          p = _skipSpaces(src, markerEnd + 1, 3);
+          markerFound = true;
+        }
+      }
+      return p;
+    }
+    function _fenceAtLine(src, line) {
+      var plainStart = _skipSpaces(src, line, 4);
+      var fenceAt = _containerContentStart(src, line);
+      if (plainStart - line >= 4 && fenceAt === plainStart) return null;
+      var ch = src.charAt(fenceAt);
+      if (ch !== '`' && ch !== '~') return null;
+      var runEnd = _runEnd(src, fenceAt, ch);
+      if (runEnd - fenceAt < 3) return null;
+      return { at: fenceAt, ch: ch, length: runEnd - fenceAt, line: line };
+    }
+    function _fenceCloseEnd(src, line, fence) {
+      var closeAt = _containerContentStart(src, line);
+      // List markers can indent continuation lines beyond the usual three spaces.
+      if (src.charAt(closeAt) !== fence.ch && fence.at > fence.line) {
+        var alt = line;
+        var allowance = fence.at - fence.line;
+        while (alt < src.length && allowance > 0 &&
+               (src.charAt(alt) === ' ' || src.charAt(alt) === '\t')) {
+          alt++;
+          allowance--;
+        }
+        if (src.charAt(alt) === fence.ch) closeAt = alt;
+      }
+      if (src.charAt(closeAt) !== fence.ch) return -1;
+      var runEnd = _runEnd(src, closeAt, fence.ch);
+      if (runEnd - closeAt < fence.length) return -1;
+      var lineEnd = _lineEnd(src, runEnd);
+      for (var p = runEnd; p < lineEnd; p++) {
+        if (src.charAt(p) !== ' ' && src.charAt(p) !== '\t') return -1;
+      }
+      return _nextLine(src, lineEnd);
+    }
+    function _fencedCodeEnd(src, fence) {
+      var openerEnd = _lineEnd(src, fence.at + fence.length);
+      var line = _nextLine(src, openerEnd);
+      while (line < src.length) {
+        var closeEnd = _fenceCloseEnd(src, line, fence);
+        if (closeEnd >= 0) return closeEnd;
+        var lineEnd = _lineEnd(src, line);
+        if (lineEnd >= src.length) break;
+        line = _nextLine(src, lineEnd);
+      }
+      return src.length;
+    }
+    function _indentedCodeEnd(src, line) {
+      var end = line;
+      while (end < src.length) {
+        var indented = src.charAt(end) === '\t' || _skipSpaces(src, end, 4) - end >= 4;
+        if (!indented) break;
+        var lineEnd = _lineEnd(src, end);
+        if (lineEnd >= src.length) return src.length;
+        end = _nextLine(src, lineEnd);
+      }
+      return end;
+    }
+    function _inlineCodeEnd(src, opener) {
+      var openerEnd = _runEnd(src, opener, '`');
+      var tickLength = openerEnd - opener;
+      var p = openerEnd;
+      while (p < src.length) {
+        if (src.charAt(p) !== '`') {
+          p++;
+          continue;
+        }
+        var closerEnd = _runEnd(src, p, '`');
+        if (closerEnd - p === tickLength) return closerEnd;
+        p = closerEnd;
+      }
+      return -1;
+    }
+    // Apply fn only to prose, preserving fenced, indented, and inline code verbatim.
+    function _mapOutsideCode(src, fn) {
+      var out = '';
+      var proseStart = 0;
+      var pos = 0;
+      while (pos < src.length) {
+        var codeEnd = -1;
+        var lineStart = pos === 0 || src.charAt(pos - 1) === '\n' || src.charAt(pos - 1) === '\r';
+        if (lineStart) {
+          var fence = _fenceAtLine(src, pos);
+          if (fence) {
+            codeEnd = _fencedCodeEnd(src, fence);
+          } else if (src.charAt(pos) === '\t' || _skipSpaces(src, pos, 4) - pos >= 4) {
+            codeEnd = _indentedCodeEnd(src, pos);
+          }
+        }
+        if (codeEnd < 0 && src.charAt(pos) === '`') codeEnd = _inlineCodeEnd(src, pos);
+        if (codeEnd < 0) {
+          pos++;
+          continue;
+        }
+        if (pos > proseStart) out += fn(src.slice(proseStart, pos));
+        out += src.slice(pos, codeEnd);
+        pos = codeEnd;
+        proseStart = codeEnd;
+      }
+      if (proseStart < src.length) out += fn(src.slice(proseStart));
+      return out;
+    }
+    function _stashInProse(t) {
+      // Stash math first (body may contain \$); then remaining \$ → sentinel.
+      t = t.replace(/\$\$([\s\S]+?)\$\$/g, function(m) { return _stashMath(m); });
+      t = t.replace(/\\\[([\s\S]+?)\\\]/g, function(m) { return _stashMath(m); });
+      t = t.replace(/\\\(([\s\S]+?)\\\)/g, function(m) { return _stashMath(m); });
+      // Inline $...$: skip $digit openers (currency) and digit$ openers; allow \$ in body.
+      t = t.replace(/(^|[^\\$\d])\$(?![\d$])((?:\\.|[^\\$\r\n])+?)\$(?![\d$])/g, function(m, pre, body) {
+        return pre + _stashMath('$' + body + '$');
+      });
+      t = t.replace(/\\\$/g, '%%NPPESCDOL%%');
+      return t;
+    }
+    parseContent = _mapOutsideCode(content, _stashInProse);
+  }
+
   // Render with marked.js defaults (handles images, code, tables, etc.)
-  html += marked.parse(content, {gfm: true, breaks: false});
+  html += marked.parse(parseContent, {gfm: true, breaks: false});
+
+  // Restore math placeholders: <span> in text segments only; inside tags
+  // put back the escaped original ($...$) so href/alt stay plain strings.
+  function _escMathHtml(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  function _mathMeta(raw) {
+    if (raw.length >= 4 && raw.slice(0, 2) === '$$' && raw.slice(-2) === '$$')
+      return { display: true, tex: raw.slice(2, -2) };
+    if (raw.length >= 4 && raw.slice(0, 2) === '\\[' && raw.slice(-2) === '\\]')
+      return { display: true, tex: raw.slice(2, -2) };
+    if (raw.length >= 4 && raw.slice(0, 2) === '\\(' && raw.slice(-2) === '\\)')
+      return { display: false, tex: raw.slice(2, -2) };
+    if (raw.length >= 2 && raw.charAt(0) === '$' && raw.charAt(raw.length - 1) === '$')
+      return { display: false, tex: raw.slice(1, -1) };
+    return { display: false, tex: raw };
+  }
+  if (_mathSlots.length || html.indexOf('%%NPPESCDOL%%') >= 0) {
+    // Split tags without treating a '>' inside a quoted attribute as tag end.
+    function _splitHtmlTags(s) {
+      var parts = [];
+      var textStart = 0;
+      var hp = 0;
+      while (hp < s.length) {
+        if (s.charAt(hp) !== '<' || !/[A-Za-z!/?]/.test(s.charAt(hp + 1))) {
+          hp++;
+          continue;
+        }
+        var quote = '';
+        var hend = hp + 1;
+        while (hend < s.length) {
+          var hc = s.charAt(hend);
+          if (quote) {
+            if (hc === quote) quote = '';
+          } else if (hc === '"' || hc === "'") {
+            quote = hc;
+          } else if (hc === '>') {
+            break;
+          }
+          hend++;
+        }
+        if (hend >= s.length) { hp++; continue; }
+        if (hp > textStart) parts.push({ text: s.slice(textStart, hp), isTag: false });
+        parts.push({ text: s.slice(hp, hend + 1), isTag: true });
+        hp = hend + 1;
+        textStart = hp;
+      }
+      if (textStart < s.length) parts.push({ text: s.slice(textStart), isTag: false });
+      return parts;
+    }
+    function _restoreMathSlot(placeholder, index, inTag) {
+      var raw = _mathSlots[Number(index)];
+      if (typeof raw === 'undefined') return placeholder;
+      if (inTag) return _escMathHtml(raw);
+      var meta = _mathMeta(raw);
+      return '<span class="npp-math" data-display="' + (meta.display ? '1' : '0') + '">' +
+             _escMathHtml(meta.tex) + '</span>';
+    }
+    var _segs = _splitHtmlTags(html);
+    for (var _si = 0; _si < _segs.length; _si++) {
+      var _seg = _segs[_si];
+      _seg.text = _seg.text.replace(/%%NPPMATH([0-9]+)%%/g, function(m, index) {
+        return _restoreMathSlot(m, index, _seg.isTag);
+      });
+      // In attributes, turn escaped-$ sentinel into plain '$' (text uses TreeWalker).
+      if (_seg.isTag) _seg.text = _seg.text.split('%%NPPESCDOL%%').join('$');
+      _segs[_si] = _seg.text;
+    }
+    html = _segs.join('');
+  }
 
   // Post-process: add sequential IDs to block elements for scroll sync
   var blockIdx = 0;
@@ -469,7 +794,7 @@ function renderMarkdown(md) {
   // validate that count just below — if they ever drift (raw <html>
   // tokens whose first tag isn't in the regex's allowlist, etc.) we
   // clear the map so scrollToLine() falls back to proportional math.
-  var newBlockMap = _buildBlockMap(md, content);
+  var newBlockMap = _buildBlockMap(md, contentForMap);
   var actualBlockCount = document.querySelectorAll('[id^="block-"]').length;
   if (newBlockMap.length === actualBlockCount && actualBlockCount > 0) {
     window._blockMap = newBlockMap;
@@ -489,7 +814,32 @@ function renderMarkdown(md) {
     });
   }
 
-  // Diagrams: "squared" style when enabled, else mermaid (see window.renderDiagrams).
+  // Math: katex.render on stashed .npp-math slots only (currency stays literal).
+  if (typeof katex !== 'undefined') {
+    try {
+      document.querySelectorAll('#content .npp-math').forEach(function(el) {
+        var tex = el.textContent;
+        var display = el.getAttribute('data-display') === '1';
+        katex.render(tex, el, { displayMode: display, throwOnError: false });
+      });
+    } catch (e) { console.error('[NppMarkdownPanel] KaTeX', e); }
+    // Restore escaped-dollar sentinels via text-node walk — never innerHTML —
+    // so squared/mermaid nodes are not detached after they render.
+    var _root = document.getElementById('content');
+    if (_root && (_root.textContent || '').indexOf('%%NPPESCDOL%%') >= 0) {
+      var _tw = document.createTreeWalker(_root, NodeFilter.SHOW_TEXT, null);
+      var _tn, _tnodes = [];
+      while ((_tn = _tw.nextNode())) _tnodes.push(_tn);
+      for (var _ti = 0; _ti < _tnodes.length; _ti++) {
+        var _tv = _tnodes[_ti].nodeValue;
+        if (_tv && _tv.indexOf('%%NPPESCDOL%%') >= 0) {
+          _tnodes[_ti].nodeValue = _tv.split('%%NPPESCDOL%%').join('$');
+        }
+      }
+    }
+  }
+
+  // Diagrams AFTER math + escaped-$ text restore so squared nodes stay attached.
   if (window.renderDiagrams) window.renderDiagrams();
 
   window._totalLines = md.split('\n').length;
@@ -542,6 +892,11 @@ function highlightMatches(query) {
         // Allow highlighting inside <code> / <pre> but skip if that's already
         // inside a hljs-processed span chain — we'd break the coloring.
         if (p.classList && p.classList.contains('hljs')) return NodeFilter.FILTER_REJECT;
+        // Skip KaTeX output — wrapping its text nodes breaks layout/metrics.
+        if (p.classList && (p.classList.contains('katex') ||
+                            p.classList.contains('katex-html') ||
+                            p.classList.contains('katex-mathml')))
+          return NodeFilter.FILTER_REJECT;
         p = p.parentElement;
       }
       return NodeFilter.FILTER_ACCEPT;
@@ -952,6 +1307,7 @@ static void loadSettings() {
         if ((v = dict[@"enableMermaid"])) sSettings.enableMermaid = [v boolValue];
         if ((v = dict[@"enableSquared"])) sSettings.enableSquared = [v boolValue];
         if ((s = dict[@"squaredTheme"])) sSettings.squaredTheme = [s UTF8String];
+        if ((v = dict[@"enableMath"])) sSettings.enableMath = [v boolValue];
         if ((v = dict[@"syncPreviewToEditor"])) sSettings.syncPreviewToEditor = [v boolValue];
 
         // Migration: ensure .mmd is in the supported extensions list
@@ -993,6 +1349,7 @@ static void saveSettings() {
             @"enableMermaid": @(sSettings.enableMermaid),
             @"enableSquared": @(sSettings.enableSquared),
             @"squaredTheme": @(sSettings.squaredTheme.c_str()),
+            @"enableMath": @(sSettings.enableMath),
             @"syncPreviewToEditor": @(sSettings.syncPreviewToEditor),
         };
         NSData *data = [NSJSONSerialization dataWithJSONObject:dict
@@ -1638,10 +1995,11 @@ static void loadTemplateIntoWebView() {
             accessURL = [NSURL fileURLWithPath:NSTemporaryDirectory()];
         }
 
-        // When squared is enabled, the preview imports the engine from the plugin
-        // resources dir (a different tree). Widen the read-access scope to the common
-        // ancestor of the preview file and the resources dir so the file:// import +
-        // worker resolve. (Only when the feature is on.)
+        // When squared is enabled, the preview loads the engine from the plugin
+        // resources dir (a different tree). Widen the read-access scope to the
+        // common ancestor of the preview file and the resources dir so file://
+        // imports (squared) resolve. KaTeX fonts are embedded as data: URIs in
+        // the template CSS, so math does not require this widening.
         if (sSettings.enableSquared) {
             NSString *htmlDir = [tmpPath stringByDeletingLastPathComponent];
             NSString *resDir  = [NSString stringWithUTF8String:sResourcesDir.c_str()];
@@ -2186,6 +2544,8 @@ static void loadTemplateIntoExportWebView() {
             tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"npp-md-export.html"];
             accessURL = [NSURL fileURLWithPath:NSTemporaryDirectory()];
         }
+        // Squared needs resources/ via common-ancestor scope; KaTeX fonts are
+        // data: URIs in the template — do not widen for math alone.
         if (sSettings.enableSquared) {
             NSString *htmlDir = [tmpPath stringByDeletingLastPathComponent];
             NSString *resDir  = [NSString stringWithUTF8String:sResourcesDir.c_str()];
@@ -2230,30 +2590,56 @@ static bool isMacroPlayingBack() {
     return false;
 }
 
-// "Diagrams have settled": no squared block still pending AND every mermaid node
-// carries its rendered <svg>. Files without diagrams satisfy this immediately.
+// "Render has settled": no squared block still pending, every mermaid node
+// carries its rendered <svg>, and web fonts (KaTeX) are no longer loading.
+// KaTeX itself is synchronous inside renderMarkdown(); fonts may still be in flight.
+// Files without diagrams/math satisfy this immediately.
 static NSString *const kExportSettleJS =
     @"(function(){if(document.querySelector('pre.squared-pending'))return false;"
      "var m=document.querySelectorAll('.mermaid');"
-     "for(var i=0;i<m.length;i++){if(!m[i].querySelector('svg'))return false;}return true;})()";
+     "for(var i=0;i<m.length;i++){if(!m[i].querySelector('svg'))return false;}"
+     "if(document.fonts&&document.fonts.status==='loading')return false;"
+     "return true;})()";
 
-// Clone the document, strip the (heavy) <script> tags, inline every <img> as a
-// data: URI, and return a self-contained HTML string. Operates on a CLONE so the
-// live preview DOM is never mutated. Async (fetch) → callAsyncJavaScript.
+// Clone the document, strip the (heavy) <script> tags, inline every <img> and
+// every non-data url(...) inside <style> (KaTeX fonts) as data: URIs, and return
+// a self-contained HTML string. Operates on a CLONE so the live preview DOM is
+// never mutated. Async (fetch) → callAsyncJavaScript.
 static NSString *const kExportInlineHtmlJS =
     @"const clone = document.documentElement.cloneNode(true);"
      "clone.querySelectorAll('script').forEach(s => s.remove());"
+     "async function toDataURL(href) {"
+     "  const resp = await fetch(href); const blob = await resp.blob();"
+     "  return await new Promise((res, rej) => { const fr = new FileReader();"
+     "    fr.onloadend = () => res(fr.result); fr.onerror = rej; fr.readAsDataURL(blob); });"
+     "}"
      "const imgs = Array.from(clone.querySelectorAll('img'));"
      "for (const img of imgs) { try {"
      "  const s = img.getAttribute('src');"
      "  if (s && !s.startsWith('data:')) {"
-     "    const abs = new URL(s, document.baseURI).href;"
-     "    const resp = await fetch(abs); const blob = await resp.blob();"
-     "    const durl = await new Promise((res, rej) => { const fr = new FileReader();"
-     "      fr.onloadend = () => res(fr.result); fr.onerror = rej; fr.readAsDataURL(blob); });"
-     "    img.setAttribute('src', durl);"
+     "    img.setAttribute('src', await toDataURL(new URL(s, document.baseURI).href));"
      "  }"
      "} catch (e) {} }"
+     "for (const style of clone.querySelectorAll('style')) {"
+     "  let css = style.textContent || '';"
+     "  const re = /url\\((['\"]?)([^)'\"]+)\\1\\)/g;"
+     "  const seen = new Map();"
+     "  let m; const jobs = [];"
+     "  while ((m = re.exec(css))) {"
+     "    const raw = m[2];"
+     "    if (!raw || raw.startsWith('data:') || raw.charAt(0) === '#') continue;"
+     "    if (seen.has(raw)) continue;"
+     "    seen.set(raw, null);"
+     "    jobs.push((async () => {"
+     "      try { seen.set(raw, await toDataURL(new URL(raw, document.baseURI).href)); }"
+     "      catch (e) { seen.set(raw, null); }"
+     "    })());"
+     "  }"
+     "  await Promise.all(jobs);"
+     "  style.textContent = css.replace(/url\\((['\"]?)([^)'\"]+)\\1\\)/g, (all, q, u) => {"
+     "    const d = seen.get(u); return d ? ('url(' + d + ')') : all;"
+     "  });"
+     "}"
      "return '<!DOCTYPE html>\\n' + clone.outerHTML;";
 
 // Render the CURRENT editor buffer into sWebView and wait (bounded) until the
@@ -2430,13 +2816,13 @@ static void exportCurrentToPdfCmd()  { exportCurrentFile(true);  }
 
 static void showSettingsCmd() {
     @autoreleasepool {
-        NSPanel *dlg = [[NSPanel alloc] initWithContentRect:NSMakeRect(200, 200, 420, 430)
+        NSPanel *dlg = [[NSPanel alloc] initWithContentRect:NSMakeRect(200, 200, 420, 460)
                                                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
                                                     backing:NSBackingStoreBuffered defer:NO];
         [dlg setTitle:@"Markdown Panel Settings"];
         NSView *cv = [dlg contentView];
         _NMPSettingsCtl *ctl = [[_NMPSettingsCtl alloc] init];
-        CGFloat y = 390;
+        CGFloat y = 420;
 
         // Zoom
         NSTextField *zoomLabel = [NSTextField labelWithString:@"Zoom Level:"];
@@ -2488,6 +2874,12 @@ static void showSettingsCmd() {
         mermaidCheck.frame = NSMakeRect(20, y, 350, 20);
         mermaidCheck.state = sSettings.enableMermaid ? NSControlStateValueOn : NSControlStateValueOff;
         [cv addSubview:mermaidCheck];
+        y -= 28;
+
+        NSButton *mathCheck = [NSButton checkboxWithTitle:@"Enable KaTeX math rendering ($…$, $$…$$)" target:nil action:nil];
+        mathCheck.frame = NSMakeRect(20, y, 380, 20);
+        mathCheck.state = sSettings.enableMath ? NSControlStateValueOn : NSControlStateValueOff;
+        [cv addSubview:mathCheck];
         y -= 28;
 
         // Squared flow diagrams + theme radios, gated on the checkbox
@@ -2557,6 +2949,8 @@ static void showSettingsCmd() {
         sSettings.syncWithFirstVisibleLine = firstLineCheck.state == NSControlStateValueOn;
         bool newMermaid = mermaidCheck.state == NSControlStateValueOn;
         if (newMermaid != sSettings.enableMermaid) { sSettings.enableMermaid = newMermaid; needsReload = true; }
+        bool newMath = mathCheck.state == NSControlStateValueOn;
+        if (newMath != sSettings.enableMath) { sSettings.enableMath = newMath; needsReload = true; }
         bool newSquared = squaredCheck.state == NSControlStateValueOn;
         if (newSquared != sSettings.enableSquared) { sSettings.enableSquared = newSquared; needsReload = true; }
         std::string newTheme = themeLinen.state == NSControlStateValueOn ? "linen"
@@ -2617,8 +3011,9 @@ static void showAboutCmd() {
             "- Scroll synchronization\n"
             "- Export to HTML\n"
             "- YAML frontmatter display\n"
-            "- Mermaid diagram support (optional)\n\n"
-            "Rendering: marked.js + highlight.js in WKWebView\n\n"
+            "- Mermaid diagram support (optional)\n"
+            "- KaTeX math rendering (optional, on by default)\n\n"
+            "Rendering: marked.js + highlight.js + KaTeX in WKWebView\n\n"
             "Original Windows plugin by Jens Wollgarten (GPLv2)\n"
             "macOS port using native WebKit rendering.";
         [alert addButtonWithTitle:@"OK"];
