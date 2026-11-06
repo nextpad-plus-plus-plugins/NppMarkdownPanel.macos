@@ -60,6 +60,12 @@ With dark mode enabled in Notepad++:
 To open the settings for this plugin: Plugins -> MarkdownPanel -> Settings
 ![npp-settings](help/open-settings.png "open settings dialog")
 
+* #### Enable KaTeX math rendering (macOS)
+	When enabled (default), LaTeX-style math in the preview is rendered with [KaTeX](https://katex.org/) (MIT, bundled locally — no CDN).
+
+	Supported delimiters: inline `$...$` / `\(...\)`, display `$$...$$` / `\[...\]`.
+	Math inside fenced or inline code is left as literal text. Escaped dollars (`\$`) are not treated as math delimiters. Disable this option if you need raw `$` without math.
+
 * #### HTML Rendering Engine
 	This option allows you to switch between two HTML Rendering Engines.
 	

@@ -1,0 +1,1 @@
+KaTeX v0.18.4 (MIT) — https://katex.org/
