@@ -40,6 +40,7 @@ struct MarkdownSettings {
     bool syncWithCaret = true;
     bool syncWithFirstVisibleLine = true;
     bool allowAllExtensions = false;
+    bool supportFilesWithNoExt = false;      // preview unsaved/extensionless tabs (issue #474)
     std::string supportedExtensions = "md,mkd,mdwn,mdown,mdtxt,markdown,mmd";
     bool enableMermaid = false;
     bool enableSquared = false;              // render mermaid flowcharts in the "squared" style
@@ -146,7 +147,9 @@ static std::string getCurrentExtension() {
 static bool isSupportedExtension() {
     if (sSettings.allowAllExtensions) return true;
     std::string ext = getCurrentExtension();
-    if (ext.empty()) return false;
+    // Unsaved tabs ("new 1") and extensionless files have no extension;
+    // upstream Windows v0.9.1 gates these on their own setting (issue #133).
+    if (ext.empty()) return sSettings.supportFilesWithNoExt;
     // Remove leading dot
     if (ext[0] == '.') ext = ext.substr(1);
     // Lowercase
@@ -948,6 +951,7 @@ static void loadSettings() {
         if ((v = dict[@"syncWithCaret"])) sSettings.syncWithCaret = [v boolValue];
         if ((v = dict[@"syncWithFirstVisibleLine"])) sSettings.syncWithFirstVisibleLine = [v boolValue];
         if ((v = dict[@"allowAllExtensions"])) sSettings.allowAllExtensions = [v boolValue];
+        if ((v = dict[@"supportFilesWithNoExt"])) sSettings.supportFilesWithNoExt = [v boolValue];
         if ((s = dict[@"supportedExtensions"])) sSettings.supportedExtensions = [s UTF8String];
         if ((v = dict[@"enableMermaid"])) sSettings.enableMermaid = [v boolValue];
         if ((v = dict[@"enableSquared"])) sSettings.enableSquared = [v boolValue];
@@ -989,6 +993,7 @@ static void saveSettings() {
             @"syncWithCaret": @(sSettings.syncWithCaret),
             @"syncWithFirstVisibleLine": @(sSettings.syncWithFirstVisibleLine),
             @"allowAllExtensions": @(sSettings.allowAllExtensions),
+            @"supportFilesWithNoExt": @(sSettings.supportFilesWithNoExt),
             @"supportedExtensions": @(sSettings.supportedExtensions.c_str()),
             @"enableMermaid": @(sSettings.enableMermaid),
             @"enableSquared": @(sSettings.enableSquared),
@@ -2430,13 +2435,13 @@ static void exportCurrentToPdfCmd()  { exportCurrentFile(true);  }
 
 static void showSettingsCmd() {
     @autoreleasepool {
-        NSPanel *dlg = [[NSPanel alloc] initWithContentRect:NSMakeRect(200, 200, 420, 430)
+        NSPanel *dlg = [[NSPanel alloc] initWithContentRect:NSMakeRect(200, 200, 420, 458)
                                                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
                                                     backing:NSBackingStoreBuffered defer:NO];
         [dlg setTitle:@"Markdown Panel Settings"];
         NSView *cv = [dlg contentView];
         _NMPSettingsCtl *ctl = [[_NMPSettingsCtl alloc] init];
-        CGFloat y = 390;
+        CGFloat y = 418;
 
         // Zoom
         NSTextField *zoomLabel = [NSTextField labelWithString:@"Zoom Level:"];
@@ -2464,6 +2469,12 @@ static void showSettingsCmd() {
         allExtCheck.frame = NSMakeRect(20, y, 350, 20);
         allExtCheck.state = sSettings.allowAllExtensions ? NSControlStateValueOn : NSControlStateValueOff;
         [cv addSubview:allExtCheck];
+        y -= 28;
+
+        NSButton *noExtCheck = [NSButton checkboxWithTitle:@"Enable preview for files without extension" target:nil action:nil];
+        noExtCheck.frame = NSMakeRect(20, y, 350, 20);
+        noExtCheck.state = sSettings.supportFilesWithNoExt ? NSControlStateValueOn : NSControlStateValueOff;
+        [cv addSubview:noExtCheck];
         y -= 28;
 
         NSButton *autoShowCheck = [NSButton checkboxWithTitle:@"Automatically show panel for supported files" target:nil action:nil];
@@ -2552,6 +2563,7 @@ static void showSettingsCmd() {
         if (newZoom != sSettings.zoomLevel) { sSettings.zoomLevel = newZoom; needsReload = true; }
         sSettings.supportedExtensions = [extField.stringValue UTF8String];
         sSettings.allowAllExtensions = allExtCheck.state == NSControlStateValueOn;
+        sSettings.supportFilesWithNoExt = noExtCheck.state == NSControlStateValueOn;
         sSettings.autoShowPanel = autoShowCheck.state == NSControlStateValueOn;
         sSettings.syncWithCaret = caretCheck.state == NSControlStateValueOn;
         sSettings.syncWithFirstVisibleLine = firstLineCheck.state == NSControlStateValueOn;
