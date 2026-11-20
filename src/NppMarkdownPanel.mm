@@ -304,6 +304,7 @@ static NSString *commonAncestorDir(NSString *a, NSString *b) {
 static void buildTemplate() {
     @autoreleasepool {
         std::string markedJS = readFileToString(sResourcesDir + "/marked.min.js");
+        std::string purifyJS = readFileToString(sResourcesDir + "/purify.min.js");
         std::string hljsJS = readFileToString(sResourcesDir + "/highlight.min.js");
         std::string hljsLightCSS = readFileToString(sResourcesDir + "/hljs-github.css");
         std::string hljsDarkCSS = readFileToString(sResourcesDir + "/hljs-github-dark.css");
@@ -320,6 +321,20 @@ static void buildTemplate() {
         }
 
         std::string html = "<!DOCTYPE html>\n<html><head>\n<meta charset=\"utf-8\">\n";
+        // Defense-in-depth CSP (upstream 0.9.3 security parity, bead nppmac-hoo).
+        // The page's own scripts/styles are inline, squared loads as a file://
+        // module + worker with local fetches, and documents may reference local
+        // or remote images — but nothing may connect out (no exfiltration),
+        // embed subdocuments, or submit forms. DOMPurify (below) is the primary
+        // control; this contains whatever might slip past it.
+        html += "<meta http-equiv=\"Content-Security-Policy\" content=\""
+                "default-src 'none'; script-src 'unsafe-inline' file:; "
+                "style-src 'unsafe-inline' file:; "
+                "img-src file: data: https: http:; "
+                "media-src file: data: https: http:; "
+                "font-src file: data:; connect-src file:; "
+                "worker-src file: blob:; child-src file: blob:; "
+                "object-src 'none'; base-uri 'none'; form-action 'none'\">\n";
         html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n";
 
         // CSS
@@ -339,6 +354,14 @@ static void buildTemplate() {
 
         // JS libraries
         html += "<script>\n" + markedJS + "\n</script>\n";
+        if (!purifyJS.empty()) {
+            html += "<script>\n" + purifyJS + "\n</script>\n";
+        } else {
+            // renderMarkdown() falls back to plain-text rendering when
+            // DOMPurify is absent — never raw HTML.
+            NSLog(@"[MarkdownPanel] ERROR: purify.min.js not found in %s — "
+                  @"preview will render plain text only", sResourcesDir.c_str());
+        }
         if (!hljsJS.empty()) {
             html += "<script>\n" + hljsJS + "\n</script>\n";
         }
@@ -405,7 +428,9 @@ window.renderDiagrams = function() {
     blocks.forEach(function(el) {
       var pre = el.parentNode;
       pre.classList.add('mermaid');
-      pre.innerHTML = el.textContent;
+      // textContent, not innerHTML: mermaid reads the element's text itself,
+      // and the block's raw text must never be parsed as HTML.
+      pre.textContent = el.textContent;
     });
     try { mermaid.run({ querySelector: '.mermaid' }); } catch (e) {}
   }
@@ -447,7 +472,22 @@ function renderMarkdown(md) {
       return '<' + tag + ' id="block-' + (blockIdx++) + '"' + after;
     });
 
-  document.getElementById('content').innerHTML = html;
+  // Sanitize before insertion (upstream 0.9.3 parity): raw HTML embedded in
+  // the markdown must not execute in the preview. DOMPurify's defaults keep
+  // id/class (block-N scroll sync, language-* code blocks) and strip script,
+  // event handlers and dangerous URLs. The default URI allowlist is extended
+  // with file: so local images keep working (upstream re-allowed file:// the
+  // same way in their sanitizer config).
+  if (window.DOMPurify) {
+    html = DOMPurify.sanitize(html, {
+      ALLOWED_URI_REGEXP:
+        /^(?:(?:https?|mailto|tel|file):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
+    });
+    document.getElementById('content').innerHTML = html;
+  } else {
+    // Fail closed: without the sanitizer, never parse the document as HTML.
+    document.getElementById('content').textContent = md;
+  }
 
   // Cache-bust local images. WebKit's memory cache serves file:// images
   // by URL for the lifetime of the web process, so an image edited on disk
